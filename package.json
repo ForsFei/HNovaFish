@@ -1,0 +1,198 @@
+{
+  "name": "hnova-fish",
+  "displayName": "HNova Fish · 随手读",
+  "description": "在 VS Code 中只读浏览贴吧、知乎，支持收藏、历史与专注阅读。",
+  "version": "0.1.6",
+  "publisher": "hnova",
+  "engines": {
+    "vscode": "^1.143.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "license": "MIT",
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:hnovaFish.feed",
+    "onView:hnovaFish.reader"
+  ],
+  "scripts": {
+    "compile": "tsc -p . && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js --sourcemap",
+    "watch": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js --sourcemap --watch",
+    "test": "npm run compile && node --test dist/test/*.test.js",
+    "package": "vsce package --no-dependencies --allow-missing-repository",
+    "vscode:prepublish": "npm run compile"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "hnovaFish.refresh",
+        "title": "刷新列表",
+        "category": "HNova Fish",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "hnovaFish.addForum",
+        "title": "添加贴吧",
+        "category": "HNova Fish",
+        "icon": "$(add)"
+      },
+      {
+        "command": "hnovaFish.openUrl",
+        "title": "阅读帖子链接",
+        "category": "HNova Fish",
+        "icon": "$(link)"
+      },
+      {
+        "command": "hnovaFish.cookie",
+        "title": "设置或清除登录 Cookie",
+        "category": "HNova Fish",
+        "icon": "$(key)"
+      },
+      {
+        "command": "hnovaFish.hide",
+        "title": "隐藏阅读窗口",
+        "category": "HNova Fish",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "hnovaFish.clearHistory",
+        "title": "清空阅读历史",
+        "category": "HNova Fish"
+      },
+      {
+        "command": "hnovaFish.focusReader",
+        "title": "打开右侧阅读栏",
+        "category": "HNova Fish",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "hnovaFish.reloadReader",
+        "title": "重新加载正文",
+        "category": "HNova Fish",
+        "icon": "$(refresh)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "hnovaFish",
+          "title": "随手读",
+          "icon": "media/fish.svg"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "hnovaFishReading",
+          "title": "随手读 · 阅读",
+          "icon": "media/fish.svg"
+        }
+      ]
+    },
+    "views": {
+      "hnovaFish": [
+        {
+          "id": "hnovaFish.feed",
+          "name": "随手读"
+        }
+      ],
+      "hnovaFishReading": [
+        {
+          "id": "hnovaFish.reader",
+          "name": "阅读",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "hnovaFish.refresh",
+          "when": "view == hnovaFish.feed",
+          "group": "navigation"
+        },
+        {
+          "command": "hnovaFish.addForum",
+          "when": "view == hnovaFish.feed",
+          "group": "navigation"
+        },
+        {
+          "command": "hnovaFish.openUrl",
+          "when": "view == hnovaFish.feed",
+          "group": "navigation"
+        },
+        {
+          "command": "hnovaFish.cookie",
+          "when": "view == hnovaFish.feed",
+          "group": "settings"
+        },
+        {
+          "command": "hnovaFish.reloadReader",
+          "when": "view == hnovaFish.reader",
+          "group": "navigation"
+        },
+        {
+          "command": "hnovaFish.hide",
+          "when": "view == hnovaFish.reader",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "hnovaFish.hide",
+        "key": "ctrl+alt+;",
+        "mac": "cmd+alt+;"
+      }
+    ],
+    "configuration": {
+      "title": "HNova Fish",
+      "properties": {
+        "hnovaFish.forums": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "图拉丁"
+          ],
+          "description": "关注的贴吧名称，不含末尾的吧字。"
+        },
+        "hnovaFish.showImages": {
+          "type": "boolean",
+          "default": false,
+          "description": "允许加载正文远程图片（会向图片服务发送网络请求）。"
+        },
+        "hnovaFish.fontSize": {
+          "type": "number",
+          "default": 15,
+          "minimum": 12,
+          "maximum": 24,
+          "description": "正文字号。"
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/jsdom": "^30.0.0",
+    "@types/json-bigint": "^1.0.4",
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.7.0",
+    "esbuild": "^0.28.2",
+    "jsdom": "^30.1.3",
+    "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "json-bigint": "^1.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ForsFei/HNovaFish.git"
+  },
+  "homepage": "https://github.com/ForsFei/HNovaFish#readme",
+  "bugs": {
+    "url": "https://github.com/ForsFei/HNovaFish/issues"
+  }
+}

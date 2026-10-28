@@ -1,0 +1,13 @@
+src/**
+.vscode/**
+node_modules/**
+**/*.map
+**/test/**
+dist/model.js
+dist/providers.js
+dist/render.js
+dist/readerScript.js
+dist/comments.js
+.gitignore
+tsconfig.json
+*-sample.html

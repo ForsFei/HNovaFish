@@ -1,0 +1,241 @@
+import * as cheerio from 'cheerio';
+import JSONbig from 'json-bigint';
+import { Article, Entry, Site, assertSiteUrl, parseLink } from './model';
+
+export const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+export class PlatformError extends Error {}
+const platformJson = JSONbig({ storeAsString: true });
+export const ZHIHU_RECOMMEND_URL = 'https://www.zhihu.com/api/v3/feed/topstory/recommend?desktop=true&limit=20&action=down&after_id=0&page_number=1';
+export interface RecommendationPage { entries: Entry[]; nextUrl?: string; }
+
+export function validateRecommendationUrl(input: string): string | undefined {
+  try {
+    const url = new URL(input, ZHIHU_RECOMMEND_URL);
+    if (!['http:', 'https:'].includes(url.protocol) || url.hostname !== 'www.zhihu.com' || url.pathname !== '/api/v3/feed/topstory/recommend' || url.username || url.password || url.port || input.length > 8192) return;
+    url.protocol = 'https:'; url.hash = '';
+    return url.href;
+  } catch { return; }
+}
+
+export function parseRecommendations(body: string, currentUrl = ZHIHU_RECOMMEND_URL): RecommendationPage {
+  const result = platformJson.parse(body);
+  if (result.error) throw new PlatformError('知乎推荐接口拒绝访问，请更新知乎 Cookie 或在原站完成验证。');
+  if (!Array.isArray(result.data)) throw new PlatformError('知乎推荐返回格式已变化，未读取到推荐列表。');
+  const entries = new Map<string, Entry>();
+  for (const feed of result.data) {
+    if (!feed || /advert|promotion|commercial/i.test(String(feed.type)) || feed.ad || feed.is_ad || feed.promotion) continue;
+    const target = feed.target;
+    if (!target || target.is_ad || !/^\d+$/.test(String(target.id))) continue;
+    let url: string, title: string, label: string;
+    if (target.type === 'answer' && /^\d+$/.test(String(target.question?.id)) && typeof target.question?.title === 'string') {
+      url = `https://www.zhihu.com/question/${target.question.id}/answer/${target.id}`;
+      title = target.question.title; label = '回答';
+    } else if (target.type === 'article' && typeof target.title === 'string') {
+      url = `https://zhuanlan.zhihu.com/p/${target.id}`; title = target.title; label = '文章';
+    } else if (target.type === 'question' && typeof target.title === 'string') {
+      url = `https://www.zhihu.com/question/${target.id}`; title = target.title; label = '问题';
+    } else continue;
+    const entry = parseLink(url);
+    const excerpt = typeof target.excerpt === 'string' ? cheerio.load(target.excerpt).text().trim() : '';
+    const author = typeof target.author?.name === 'string' ? target.author.name : '';
+    entries.set(entry.id, { ...entry, title, summary: excerpt, description: `${label}${author ? ` · ${author}` : ''}` });
+  }
+  let nextUrl: string | undefined;
+  if (result.paging?.is_end !== true && typeof result.paging?.next === 'string') {
+    const next = validateRecommendationUrl(result.paging.next);
+    if (next && next !== validateRecommendationUrl(currentUrl)) nextUrl = next;
+  }
+  return { entries: [...entries.values()], nextUrl };
+}
+
+export async function request(url: string, site: Site, cookie?: string, fetcher: typeof fetch = fetch): Promise<string> {
+  assertSiteUrl(url, site);
+  const response = await fetcher(url, {
+    redirect: 'manual', signal: AbortSignal.timeout(18000),
+    headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json,text/html;q=0.9', ...(cookie ? { Cookie: cookie } : {}) }
+  });
+  if ([301, 302, 303, 307, 308, 401, 403, 429].includes(response.status)) throw new PlatformError('平台要求登录或安全验证。请在浏览器完成验证，再设置 Cookie 后重试；Cookie 也可能无法解除访问限制。');
+  if (!response.ok) throw new Error(`平台请求失败（HTTP ${response.status}）。`);
+  // Bound responses before parsing or storing them.
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('平台返回了空内容。');
+  const chunks: Uint8Array[] = []; let size = 0;
+  while (true) {
+    const { done, value } = await reader.read(); if (done) break;
+    size += value.length;
+    if (size > 8 * 1024 * 1024) { await reader.cancel(); throw new Error('页面超过 8 MB，已停止加载。'); }
+    chunks.push(value);
+  }
+  const body = Buffer.concat(chunks).toString('utf8');
+  if (/百度安全验证|<title>[^<]*(?:安全验证|登录知乎)|"name"\s*:\s*"AuthenticationError"/i.test(body)) throw new PlatformError('平台返回安全验证页面。请在原站完成验证，或更新 Cookie。');
+  return body;
+}
+
+export function parseTiebaList(html: string): Entry[] {
+  // Desktop Tieba sometimes wraps its thread list in HTML comments.
+  const $ = cheerio.load(html.replace(/<!--([\s\S]*?)-->/g, (_, content: string) => content.includes('threadlist') ? content : ''));
+  const found = new Map<string, Entry>();
+  $('a[href]').each((_, el) => {
+    const a = $(el), href = a.attr('href') || '';
+    const match = href.match(/(?:\/p\/|[?&]kz=)(\d+)/);
+    const title = (a.attr('title') || a.text()).trim();
+    if (!match || title.length < 3 || /^(回复|点击|查看|\d+条)/.test(title)) return;
+    const url = `https://tieba.baidu.com/p/${match[1]}`;
+    if (!found.has(url)) found.set(url, { ...parseLink(url), title });
+  });
+  return [...found.values()];
+}
+
+export function parseZhihuList(body: string): Entry[] {
+  const data = platformJson.parse(body);
+  return (data.data || []).flatMap((item: any) => {
+    const target = item.target || {};
+    if (!/^\d+$/.test(String(target.id)) || typeof target.title !== 'string') return [];
+    return [{ ...parseLink(`https://www.zhihu.com/question/${target.id}`), title: target.title, summary: target.excerpt || '' }];
+  });
+}
+
+export function parseTiebaArticle(html: string, entry: Entry, pageUrl = entry.url): Article {
+  const $ = cheerio.load(html);
+  const sections: Article['sections'] = [];
+  $('.l_post').each((_, el) => {
+    const node = $(el), content = node.find('.d_post_content');
+    if (content.length) sections.push({ author: node.find('.p_author_name').first().text().trim() || '吧友', html: content.html() || '' });
+  });
+  if (!sections.length) $('.content').each((_, el) => {
+    if ($(el).text().trim()) sections.push({ author: '吧友', html: $(el).html() || '' });
+  });
+  if (!sections.length) throw new Error('没有解析到帖子正文，页面可能需要验证或结构已变化。');
+  const next = $('a').filter((_, el) => $(el).text().trim() === '下一页').first().attr('href');
+  let nextUrl: string | undefined;
+  if (next) {
+    try {
+      const url = assertSiteUrl(new URL(next, pageUrl).href, 'tieba');
+      if (url.pathname === new URL(entry.url).pathname && /^\d+$/.test(url.searchParams.get('pn') || '')) nextUrl = url.href;
+    } catch { /* Ignore unrelated navigation. */ }
+  }
+  return { ...entry, title: $('h3.core_title_txt').text().trim() || $('title').text().replace(/_.*$/, '').trim() || entry.title, sections, nextUrl, fetchedAt: Date.now() };
+}
+
+export function parseZhihuArticle(html: string, entry: Entry): Article {
+  const $ = cheerio.load(html);
+  const sections: Article['sections'] = [];
+  // Prefer normalized state: HTML selectors can duplicate collapsed answer previews.
+  const initial = $('#js-initialData').text();
+  if (initial) {
+    try {
+      const entities = platformJson.parse(initial).initialState?.entities;
+      const answerId = entry.url.match(/\/answer\/(\d+)/)?.[1];
+      const articleId = entry.url.includes('zhuanlan.') ? entry.url.match(/\/p\/(\d+)/)?.[1] : undefined;
+      const items: any[] = articleId ? [entities?.articles?.[articleId]] : answerId ? [entities?.answers?.[answerId]] : Object.values(entities?.answers || {});
+      for (const answer of items) if (answer?.content) sections.push({ id: answer.id ? String(answer.id) : undefined, author: answer.author?.name || '知乎用户', html: answer.content, votes: answer.voteupCount ?? answer.voteup_count });
+    } catch { /* Fall back to server-rendered content. */ }
+  }
+  if (!sections.length) $('.AnswerItem, .Post-RichTextContainer').each((_, el) => {
+    const node = $(el), content = node.hasClass('Post-RichTextContainer') ? node : node.find('.RichContent-inner .RichText').first();
+    if (content.length && content.text().trim()) sections.push({ author: node.find('.AuthorInfo-name').text().trim() || '知乎用户', html: content.html() || '' });
+  });
+  if (!sections.length) throw new PlatformError('未获取到可读正文，可能需要登录、验证，或平台未返回完整内容。可在浏览器查看原文。');
+  const kind = zhihuKind(entry);
+  return { ...entry, title: $('h1').first().text().trim() || $('title').text().replace(/ - 知乎$/, '').trim() || entry.title, sections,
+    kind, source: 'html', nextUrl: kind === 'question' ? zhihuContentUrl(entry) : undefined, fetchedAt: Date.now() };
+}
+
+export class Providers {
+  constructor(private readonly cookie: (site: Site) => Promise<string | undefined>, private readonly fetcher: typeof fetch = (...args) => fetch(...args)) {}
+  async recommendations(pageUrl = ZHIHU_RECOMMEND_URL): Promise<RecommendationPage> {
+    const url = validateRecommendationUrl(pageUrl);
+    if (!url) throw new Error('无效的知乎推荐分页地址。');
+    const cookie = await this.cookie('zhihu');
+    if (!cookie?.trim()) throw new PlatformError('个性化推荐需要知乎登录状态，请先通过标题栏钥匙菜单设置知乎 Cookie。');
+    return parseRecommendations(await request(url, 'zhihu', cookie, this.fetcher), url);
+  }
+  async list(site: Site, forum?: string, page = 0): Promise<Entry[]> {
+    const url = site === 'tieba'
+      ? `https://tieba.baidu.com/f?kw=${encodeURIComponent(forum || '图拉丁')}&ie=utf-8&pn=${page * 50}`
+      : 'https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=30&desktop=true';
+    const body = await request(url, site, await this.cookie(site), this.fetcher);
+    const list = site === 'tieba' ? parseTiebaList(body) : parseZhihuList(body);
+    if (!list.length) throw new Error('没有获取到帖子，可能是页面结构变化或访问受限。');
+    return list;
+  }
+  async article(entry: Entry, pageUrl?: string): Promise<Article> {
+    const cookie = await this.cookie(entry.site);
+    if (entry.site === 'tieba') {
+      const html = await request(pageUrl || entry.url, entry.site, cookie, this.fetcher);
+      return parseTiebaArticle(html, entry, pageUrl);
+    }
+    if (pageUrl) {
+      const valid = validateZhihuPage(pageUrl, entry);
+      if (!valid) throw new Error('无效的知乎回答分页地址。');
+      return parseZhihuContent(await request(valid, 'zhihu', cookie, this.fetcher), entry, valid);
+    }
+    // Question HTML can be an empty client-rendered shell even with a valid login.
+    // Read the answers endpoint first, then retain HTML as a compatibility fallback.
+    const api = zhihuContentUrl(entry);
+    let apiError: unknown;
+    try {
+      return parseZhihuContent(await request(api, 'zhihu', cookie, this.fetcher), entry, api);
+    } catch (error) { apiError = error; }
+    try {
+      return parseZhihuArticle(await request(entry.url, 'zhihu', cookie, this.fetcher), entry);
+    } catch (htmlError) {
+      const detail = (error: unknown) => error instanceof Error ? error.message : '未知错误';
+      throw new PlatformError(`知乎正文加载失败。回答接口：${detail(apiError)} 网页解析：${detail(htmlError)}`);
+    }
+  }
+}
+
+export function zhihuContentUrl(entry: Entry): string {
+  const canonical = parseLink(entry.url);
+  if (canonical.site !== 'zhihu') throw new Error('仅支持知乎正文地址。');
+  const path = new URL(canonical.url).pathname;
+  const answer = path.match(/\/answer\/(\d+)/)?.[1];
+  const question = path.match(/^\/question\/(\d+)\/?$/)?.[1];
+  const article = new URL(canonical.url).hostname === 'zhuanlan.zhihu.com' ? path.match(/^\/p\/(\d+)/)?.[1] : undefined;
+  const include = encodeURIComponent(question ? 'data[*].content,voteup_count,author.name,question.title,question.answer_count' : 'content,voteup_count,author.name,question.title,question.answer_count,title');
+  if (answer) return `https://www.zhihu.com/api/v4/answers/${answer}?include=${include}`;
+  if (question) return `https://www.zhihu.com/api/v4/questions/${question}/answers?include=${include}&limit=10&offset=0&sort_by=default`;
+  if (article) return `https://www.zhihu.com/api/v4/articles/${article}?include=${include}`;
+  throw new Error('无法识别知乎内容地址。');
+}
+
+export function zhihuKind(entry: Entry): 'question' | 'answer' | 'article' {
+  const url = new URL(entry.url);
+  return url.hostname === 'zhuanlan.zhihu.com' ? 'article' : url.pathname.includes('/answer/') ? 'answer' : 'question';
+}
+
+export function validateZhihuPage(input: string, entry: Entry): string | undefined {
+  if (zhihuKind(entry) !== 'question') return;
+  try {
+    const expected = new URL(zhihuContentUrl(entry));
+    const next = new URL(input, expected);
+    if (!['http:', 'https:'].includes(next.protocol) || next.hostname !== expected.hostname || next.pathname !== expected.pathname || next.username || next.password || next.port) return;
+    const offset = next.searchParams.get('offset');
+    if (!offset || !/^\d{1,9}$/.test(offset)) return;
+    // Rebuild instead of forwarding arbitrary platform-supplied query parameters.
+    expected.searchParams.set('offset', String(Number(offset)));
+    return expected.href;
+  } catch { return; }
+}
+
+export function parseZhihuContent(body: string, entry: Entry, pageUrl?: string): Article {
+  const result = platformJson.parse(body);
+  if (result.error) throw new PlatformError('知乎回答接口拒绝访问，可能需要重新登录或完成验证。');
+  const items: any[] = Array.isArray(result.data) ? result.data : [result];
+  const readable = items.filter(item => typeof item?.content === 'string' && item.content.trim());
+  if (!readable.length) throw new PlatformError('回答接口未返回正文，可能尚无回答、回答受限或当前登录无权查看。');
+  const kind = zhihuKind(entry);
+  let nextUrl: string | undefined;
+  if (kind === 'question' && result.paging?.is_end !== true && typeof result.paging?.next === 'string') {
+    const next = validateZhihuPage(result.paging.next, entry);
+    if (next && Number(new URL(next).searchParams.get('offset')) > Number(new URL(pageUrl || zhihuContentUrl(entry)).searchParams.get('offset'))) nextUrl = next;
+  }
+  const total = Number(readable[0].question?.answer_count ?? readable[0].question?.answerCount ?? result.paging?.totals);
+  return { ...entry, title: readable[0].question?.title || readable[0].title || entry.title,
+    sections: readable.map(item => ({ id: item.id ? String(item.id) : undefined, author: item.author?.name || '知乎用户', html: item.content,
+      votes: typeof item.voteup_count === 'number' ? item.voteup_count : undefined,
+      url: /^\d+$/.test(String(item.id)) && kind === 'question' ? `${entry.url.replace(/\/$/, '')}/answer/${item.id}` : undefined })),
+    kind, source: 'api', nextUrl, totalAnswers: Number.isSafeInteger(total) && total >= 0 ? total : undefined,
+    questionUrl: kind === 'answer' && /^\d+$/.test(String(readable[0].question?.id)) ? `https://www.zhihu.com/question/${readable[0].question.id}` : undefined, fetchedAt: Date.now() };
+}
