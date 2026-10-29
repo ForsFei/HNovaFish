@@ -2,45 +2,52 @@ import * as vscode from 'vscode';
 import { Article, Entry, Site, mergeSections, parseLink } from './model';
 import { Providers } from './providers';
 import { renderArticle, renderEmptyReader } from './render';
-import { CommentView, commentTarget, loadComments } from './comments';
+import { CommentView, commentTarget, loadComments, loadReplies } from './comments';
+import { forumName } from './forums';
 
-type Node = { kind: 'group'; title: string; source: 'tieba' | 'zhihu' | 'recommend' | 'saved' | 'history'; forum?: string }
+type Node = { kind: 'group'; title: string; source: 'tieba' | 'tiebaHome' | 'zhihu' | 'recommend' | 'saved' | 'history'; forum?: string }
   | { kind: 'entry'; entry: Entry }
   | { kind: 'more'; group: Extract<Node, {kind: 'group'}> }
   | { kind: 'error'; message: string; url: string }
-  | { kind: 'notice'; message: string };
+  | { kind: 'notice'; message: string }
+  | { kind: 'action'; title: string; command: string; forum?: string };
 
 export function activate(context: vscode.ExtensionContext): void {
-  const providers = new Providers(async site => context.secrets.get(`cookie.${site}`));
+  const providers = new Providers(async site => context.secrets.get(`cookie.${site}`), (...args) => fetch(...args), () => vscode.workspace.getConfiguration('hnovaFish').get<string>('tiebaUserAgent'));
   const changes = new vscode.EventEmitter<void>();
   context.subscriptions.push(changes);
   const entries = (key: string) => context.globalState.get<Entry[]>(key, []);
   const lists = new Map<string, Entry[]>();
   const pages = new Map<string, number>();
   const recommendationNext = new Map<string, string>();
-  const recommendationSeen = new Set<string>();
   const loadingLists = new Set<string>();
   let listGeneration = 0;
-  function resetLists() { listGeneration++; lists.clear(); pages.clear(); recommendationNext.clear(); recommendationSeen.clear(); changes.fire(); }
+  let browsingForum: string | undefined;
+  function resetLists() { listGeneration++; lists.clear(); pages.clear(); recommendationNext.clear(); changes.fire(); }
   const config = () => vscode.workspace.getConfiguration('hnovaFish');
   const groupKey = (node: Extract<Node, {kind: 'group'}>) => `${node.source}:${node.forum || ''}`;
   const tree: vscode.TreeDataProvider<Node> = {
     onDidChangeTreeData: changes.event,
     getTreeItem(node) {
       if (node.kind === 'group') {
-        const item = new vscode.TreeItem(node.title, vscode.TreeItemCollapsibleState.Collapsed);
+        const item = new vscode.TreeItem(node.title, node.source === 'tieba' && node.forum === browsingForum ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed);
         item.iconPath = new vscode.ThemeIcon(node.source === 'saved' ? 'star-full' : node.source === 'history' ? 'history' : 'list-unordered');
         return item;
       }
       if (node.kind === 'more') {
-        const item = new vscode.TreeItem(node.group.source === 'recommend' ? '加载更多推荐…' : '加载更多帖子…'); item.command = { command: 'hnovaFish.more', title: '加载更多', arguments: [node.group] }; return item;
+        const recommended = node.group.source === 'recommend' || node.group.source === 'tiebaHome';
+        const item = new vscode.TreeItem(recommended ? '刷新推荐 · 换一批' : '加载更多帖子…'); item.command = { command: 'hnovaFish.more', title: recommended ? '刷新推荐' : '加载更多', arguments: [node.group] }; return item;
+      }
+      if (node.kind === 'action') {
+        const item = new vscode.TreeItem(node.title); item.iconPath = new vscode.ThemeIcon(node.command === 'browseForum' ? 'search' : 'star');
+        item.command = { command: `hnovaFish.${node.command}`, title: node.title, arguments: node.forum ? [node.forum] : [] }; return item;
       }
       if (node.kind === 'notice') return new vscode.TreeItem(node.message);
       if (node.kind === 'error') {
-        const item = new vscode.TreeItem('加载失败 · 点击查看原站');
-        item.tooltip = node.message; item.description = node.message;
+        const item = new vscode.TreeItem('加载失败 · 点击查看原因');
+        item.tooltip = node.message; item.description = node.message.match(/HTTP \d+/)?.[0];
         item.iconPath = new vscode.ThemeIcon('warning');
-        item.command = { command: 'hnovaFish.external', title: '查看原站', arguments: [node.url] }; return item;
+        item.command = { command: 'hnovaFish.loadError', title: '查看失败原因', arguments: [node.message, node.url] }; return item;
       }
       const item = new vscode.TreeItem(node.entry.title);
       item.description = node.entry.description;
@@ -52,6 +59,9 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!node) return [
         { kind: 'group', title: '知乎 · 个性化推荐', source: 'recommend' },
         { kind: 'group', title: '知乎 · 热榜', source: 'zhihu' },
+        { kind: 'group', title: '贴吧 · 首页推荐', source: 'tiebaHome' },
+        { kind: 'action', title: '浏览其他贴吧…', command: 'browseForum' },
+        ...(browsingForum && !config().get<string[]>('forums', []).includes(browsingForum) ? [{ kind: 'group' as const, title: `临时浏览 · ${browsingForum}吧`, source: 'tieba' as const, forum: browsingForum }] : []),
         ...config().get<string[]>('forums', ['图拉丁']).map(forum => ({ kind: 'group' as const, title: `${forum}吧`, source: 'tieba' as const, forum })),
         { kind: 'group', title: '本机收藏', source: 'saved' }, { kind: 'group', title: '阅读历史', source: 'history' }
       ];
@@ -61,8 +71,8 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         const ticket = listGeneration;
         if (!lists.has(key)) {
-          if (node.source === 'recommend') {
-            const page = await providers.recommendations();
+          if (node.source === 'recommend' || node.source === 'tiebaHome') {
+            const page = await (node.source === 'recommend' ? providers.recommendations() : providers.tiebaHome());
             if (ticket !== listGeneration) return [];
             lists.set(key, page.entries);
             if (page.nextUrl) recommendationNext.set(key, page.nextUrl);
@@ -73,11 +83,15 @@ export function activate(context: vscode.ExtensionContext): void {
           }
         }
         const children: Node[] = lists.get(key)!.map(entry => ({ kind: 'entry', entry }));
-        if (!children.length && node.source === 'recommend') children.push({ kind: 'notice', message: '本批没有可读推荐（视频、广告等已略过）' });
-        if (node.source === 'tieba' || (node.source === 'recommend' && recommendationNext.has(key))) children.push({ kind: 'more', group: node });
+        if (!children.length && (node.source === 'recommend' || node.source === 'tiebaHome')) children.push({ kind: 'notice', message: '本批没有可读推荐（视频、广告等已略过）' });
+        if (node.source === 'tieba' && node.forum && node.forum === browsingForum && !config().get<string[]>('forums', []).includes(node.forum)) {
+          children.push({ kind: 'action', title: '收藏这个贴吧', command: 'pinForum', forum: node.forum });
+          children.push({ kind: 'action', title: '关闭临时浏览', command: 'closeBrowseForum' });
+        }
+        if (node.source === 'tieba' || node.source === 'recommend' || node.source === 'tiebaHome') children.push({ kind: 'more', group: node });
         return children;
       } catch (error) {
-        return [{ kind: 'error', message: errorMessage(error), url: node.source === 'recommend' ? 'https://www.zhihu.com/' : node.source === 'zhihu' ? 'https://www.zhihu.com/hot' : `https://tieba.baidu.com/f?kw=${encodeURIComponent(node.forum || '')}` }];
+        return [{ kind: 'error', message: errorMessage(error), url: node.source === 'tiebaHome' ? 'https://tieba.baidu.com/' : node.source === 'recommend' ? 'https://www.zhihu.com/' : node.source === 'zhihu' ? 'https://www.zhihu.com/hot' : `https://tieba.baidu.com/f?kw=${encodeURIComponent(node.forum || '')}` }];
       }
     }
   };
@@ -88,6 +102,7 @@ export function activate(context: vscode.ExtensionContext): void {
   let generation = 0;
   let loadingNext = false;
   let commentViews: Record<string, CommentView> = {};
+  let fontChange: Promise<void> = Promise.resolve();
   let disposed = false;
   context.subscriptions.push({ dispose() { disposed = true; generation++; } });
   const draw = () => {
@@ -121,8 +136,19 @@ export function activate(context: vscode.ExtensionContext): void {
       view.onDidDispose(() => { if (reader === view) { reader = undefined; generation++; } }, null, context.subscriptions);
       view.webview.onDidReceiveMessage(async (message: unknown) => {
         if (!current || !message || typeof message !== 'object') return;
-        const { action, url, section } = message as { action?: string; url?: string; section?: number };
+        const { action, url, section, comment } = message as { action?: string; url?: string; section?: number; comment?: string };
         try {
+          if (action === 'fontDown' || action === 'fontUp' || action === 'fontReset') {
+            fontChange = fontChange.catch(() => {}).then(async () => {
+              const settings = config();
+              const value = action === 'fontReset' ? 15 : Math.max(12, Math.min(24, settings.get<number>('fontSize', 15) + (action === 'fontUp' ? 1 : -1)));
+              const scope = settings.inspect<number>('fontSize');
+              const target = scope?.workspaceFolderValue !== undefined ? vscode.ConfigurationTarget.WorkspaceFolder : scope?.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+              await settings.update('fontSize', value, target); draw();
+            });
+            await fontChange; return;
+          }
+          if ((action === 'replies' || action === 'repliesMore') && typeof section === 'number' && typeof comment === 'string') { await readReplies(section, comment, action === 'repliesMore'); return; }
           if ((action === 'comments' || action === 'commentsMore') && typeof section === 'number') { await readComments(section, action === 'commentsMore'); return; }
           if (action === 'hide') { await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar'); return; }
           if (action === 'original') { await external(current.url); return; }
@@ -155,12 +181,32 @@ export function activate(context: vscode.ExtensionContext): void {
       const page = await loadComments(target, await context.secrets.get('cookie.zhihu'), more ? previous?.nextUrl : undefined);
       if (ticket !== generation || current !== article) return;
       const items = more ? [...new Map([...(previous?.items || []), ...page.items].map(item => [item.id, item])).values()] : page.items;
-      commentViews[key] = { ...page, items, total: page.total ?? previous?.total };
+      commentViews[key] = { ...page, items, total: page.total ?? previous?.total, replies: more ? previous?.replies : undefined };
     } catch (error) {
       if (ticket !== generation || current !== article) return;
       commentViews[key] = { ...(previous || { items: [] }), loading: false, error: `评论加载失败：${errorMessage(error)}` };
     } finally {
       if (ticket === generation && current === article) draw();
+    }
+  }
+  async function readReplies(index: number, id: string, more: boolean) {
+    const article = current, parent = commentViews[String(index)];
+    const root = parent?.items.find(item => item.id === id);
+    if (!article || !commentTarget(article, index) || !root || !/^\d+$/.test(id) || parent.loading) return;
+    const views = parent.replies ||= {}, previous = views[id];
+    if (previous?.loading || (more && !previous?.nextUrl)) return;
+    const ticket = generation;
+    views[id] = { ...(previous || { items: root.children }), loading: true, error: undefined }; draw();
+    try {
+      const page = await loadReplies(id, await context.secrets.get('cookie.zhihu'), more ? previous?.nextUrl : undefined);
+      if (ticket !== generation || current !== article || commentViews[String(index)]?.replies !== views) return;
+      const items = [...new Map([...(more ? previous?.items || [] : root.children), ...page.items].map(item => [item.id, item])).values()];
+      views[id] = { ...page, items, total: page.total ?? previous?.total };
+    } catch (error) {
+      if (ticket !== generation || current !== article || commentViews[String(index)]?.replies !== views) return;
+      views[id] = { ...(previous || { items: root.children }), loading: false, error: `回复加载失败：${errorMessage(error)}` };
+    } finally {
+      if (ticket === generation && current === article && commentViews[String(index)]?.replies === views) draw();
     }
   }
   async function read(entry: Entry, fresh = false, nextUrl?: string) {
@@ -169,7 +215,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const validated = parseLink(entry.url);
     entry = { ...validated, title: entry.title };
     const ticket = ++generation;
-    for (const view of Object.values(commentViews)) view.loading = false;
+    for (const view of Object.values(commentViews)) { view.loading = false; for (const replies of Object.values(view.replies || {})) replies.loading = false; }
     const previous = current;
     const stored = context.globalState.get<Article[]>('articles', []).find(a => a.id === entry.id);
     const legacyQuestionCache = entry.site === 'zhihu' && /^\/question\/\d+\/?$/.test(new URL(entry.url).pathname) && !stored?.kind;
@@ -199,21 +245,25 @@ export function activate(context: vscode.ExtensionContext): void {
   }));
   command('read', read);
   command('external', external);
+  command('loadError', async (message: string, url: string) => {
+    const choice = await vscode.window.showWarningMessage(message, '打开原站', '设置 Cookie');
+    if (choice === '打开原站') await external(url);
+    if (choice === '设置 Cookie') await vscode.commands.executeCommand('hnovaFish.cookie', new URL(url).hostname === 'tieba.baidu.com' ? 'tieba' : 'zhihu');
+  });
   command('refresh', resetLists);
   command('hide', () => vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar'));
   command('focusReader', () => vscode.commands.executeCommand('hnovaFish.reader.focus'));
   command('reloadReader', async () => { if (current) await read(current, true); });
   command('more', async (group: Extract<Node, {kind: 'group'}>) => {
-    if (group.source === 'recommend') {
+    if (group.source === 'recommend' || group.source === 'tiebaHome') {
       const key = groupKey(group), next = recommendationNext.get(key), ticket = listGeneration;
-      if (!next || loadingLists.has(key)) return;
+      if (loadingLists.has(key)) return;
       loadingLists.add(key);
       try {
-        const page = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: '随手读：加载更多推荐…' }, () => providers.recommendations(next));
+        const page = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: '随手读：刷新推荐…' }, () => group.source === 'recommend' ? providers.recommendations(next) : providers.tiebaHome(next));
         if (ticket !== listGeneration) return;
-        lists.set(key, [...new Map([...(lists.get(key) || []), ...page.entries].map(entry => [entry.id, entry])).values()]);
-        recommendationSeen.add(next);
-        if (page.nextUrl && !recommendationSeen.has(page.nextUrl)) recommendationNext.set(key, page.nextUrl);
+        lists.set(key, page.entries);
+        if (page.nextUrl) recommendationNext.set(key, page.nextUrl);
         else recommendationNext.delete(key);
         changes.fire();
       } finally { loadingLists.delete(key); }
@@ -236,6 +286,28 @@ export function activate(context: vscode.ExtensionContext): void {
     const forums = config().get<string[]>('forums', []);
     if (!forums.includes(name.trim())) await config().update('forums', [...forums, name.trim()], vscode.ConfigurationTarget.Global);
   });
+  command('browseForum', async () => {
+    const input = await vscode.window.showInputBox({ title: '浏览其他贴吧', prompt: '输入准确吧名（例如：电影）或贴吧列表链接，下一步选择临时浏览或永久加入侧边栏。', validateInput: value => { try { forumName(value); return undefined; } catch (error) { return errorMessage(error); } } });
+    if (!input) return;
+    const name = forumName(input);
+    const mode = await vscode.window.showQuickPick([
+      { label: '临时浏览', description: '仅当前窗口保留，可稍后收藏', mode: 'temporary' as const },
+      { label: '永久加入侧边栏', description: '保存到常用贴吧，重启后仍然保留', mode: 'permanent' as const }
+    ], { title: `${name} · 选择浏览方式`, placeHolder: '选择临时浏览或永久加入浏览目录', ignoreFocusOut: true });
+    if (!mode) return;
+    if (mode.mode === 'permanent') await pinForum(name);
+    const previous = browsingForum;
+    browsingForum = name;
+    if (previous && previous !== browsingForum && !config().get<string[]>('forums', []).includes(previous)) { lists.delete(`tieba:${previous}`); pages.delete(`tieba:${previous}`); }
+    changes.fire();
+  });
+  async function pinForum(input: string) {
+    const name = forumName(input), forums = config().get<string[]>('forums', []);
+    if (!forums.includes(name)) await config().update('forums', [...forums, name], vscode.ConfigurationTarget.Global);
+    changes.fire();
+  }
+  command('pinForum', pinForum);
+  command('closeBrowseForum', () => { browsingForum = undefined; changes.fire(); });
   command('cookie', async (site?: Site) => {
     if (site !== 'tieba' && site !== 'zhihu') site = (await vscode.window.showQuickPick([{ label: '贴吧', site: 'tieba' as Site }, { label: '知乎', site: 'zhihu' as Site }], { title: '选择登录平台' }))?.site;
     if (!site) return;
@@ -252,7 +324,10 @@ export function activate(context: vscode.ExtensionContext): void {
     await context.globalState.update('history', []); await context.globalState.update('articles', []); changes.fire();
     void vscode.window.showInformationMessage('阅读历史和正文缓存已清空，收藏保留。');
   });
-  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => { if (e.affectsConfiguration('hnovaFish')) { resetLists(); draw(); } }));
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+    if (e.affectsConfiguration('hnovaFish.forums') || e.affectsConfiguration('hnovaFish.tiebaUserAgent')) resetLists();
+    if (e.affectsConfiguration('hnovaFish')) draw();
+  }));
 }
 
 function errorMessage(error: unknown): string {

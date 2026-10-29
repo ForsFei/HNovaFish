@@ -6,7 +6,7 @@ const json = JSONbig({ storeAsString: true });
 export interface CommentTarget { type: 'answers' | 'articles'; id: string; }
 export interface CommentItem { id: string; author: string; html: string; votes?: number; replyTo?: string; children: CommentItem[]; moreReplies: number; }
 export interface CommentPage { items: CommentItem[]; nextUrl?: string; total?: number; }
-export interface CommentView extends CommentPage { loading?: boolean; error?: string; }
+export interface CommentView extends CommentPage { loading?: boolean; error?: string; replies?: Record<string, CommentView>; }
 
 export function commentTarget(article: Article, index: number): CommentTarget | undefined {
   if (article.site !== 'zhihu' || !Number.isInteger(index) || !article.sections[index]) return;
@@ -34,7 +34,7 @@ export function validateCommentPage(input: string, target: CommentTarget): strin
   } catch { return; }
 }
 
-export function parseComments(body: string, target: CommentTarget, pageUrl: string): CommentPage {
+function parseCommentData(body: string, pageUrl: string, validate: (input: string) => string | undefined): CommentPage {
   const result = json.parse(body);
   if (result.error || !Array.isArray(result.data)) throw new PlatformError('评论接口未返回可读评论，可能已关闭评论或当前账号无权查看。');
   const parseItem = (item: any, nested = false): CommentItem | undefined => {
@@ -47,9 +47,45 @@ export function parseComments(body: string, target: CommentTarget, pageUrl: stri
       children, moreReplies: Number.isSafeInteger(count) ? Math.max(0, count - children.length) : 0 };
   };
   const items: CommentItem[] = result.data.flatMap((item: any) => { const value = parseItem(item); return value ? [value] : []; });
-  const next = result.paging?.is_end !== true && typeof result.paging?.next === 'string' ? validateCommentPage(result.paging.next, target) : undefined;
+  const next = result.paging?.is_end !== true && typeof result.paging?.next === 'string' ? validate(result.paging.next) : undefined;
   const total = Number(result.common_counts ?? result.paging?.totals);
-  return { items, nextUrl: next && next !== validateCommentPage(pageUrl, target) ? next : undefined, total: Number.isSafeInteger(total) && total >= 0 ? total : undefined };
+  return { items, nextUrl: next && next !== validate(pageUrl) ? next : undefined, total: Number.isSafeInteger(total) && total >= 0 ? total : undefined };
+}
+
+export function parseComments(body: string, target: CommentTarget, pageUrl: string): CommentPage {
+  return parseCommentData(body, pageUrl, input => validateCommentPage(input, target));
+}
+
+export function replyUrl(id: string, legacy = false): string {
+  if (!/^\d+$/.test(id)) throw new Error('无效的评论 ID。');
+  return legacy ? `https://www.zhihu.com/api/v4/comments/${id}/child_comments?order_by=ts&limit=20&offset=0`
+    : `https://www.zhihu.com/api/v4/comment_v5/comment/${id}/child_comment?order_by=ts&limit=20&offset=`;
+}
+
+export function validateReplyPage(input: string, id: string): string | undefined {
+  try {
+    const url = new URL(input, replyUrl(id));
+    if (!['http:', 'https:'].includes(url.protocol) || url.hostname !== 'www.zhihu.com' || ![new URL(replyUrl(id)).pathname, new URL(replyUrl(id, true)).pathname].includes(url.pathname) || url.port || url.username || url.password || input.length > 8192) return;
+    url.protocol = 'https:'; url.hash = ''; return url.href;
+  } catch { return; }
+}
+
+export function parseReplies(body: string, id: string, pageUrl: string): CommentPage {
+  return parseCommentData(body, pageUrl, input => validateReplyPage(input, id));
+}
+
+export async function loadReplies(id: string, cookie?: string, nextUrl?: string, fetcher: typeof fetch = fetch): Promise<CommentPage> {
+  if (nextUrl) {
+    const valid = validateReplyPage(nextUrl, id);
+    if (!valid) throw new Error('无效的楼中楼分页地址。');
+    return parseReplies(await request(valid, 'zhihu', cookie, fetcher), id, valid);
+  }
+  const url = replyUrl(id);
+  try { return parseReplies(await request(url, 'zhihu', cookie, fetcher), id, url); }
+  catch {
+    const fallback = replyUrl(id, true);
+    return parseReplies(await request(fallback, 'zhihu', cookie, fetcher), id, fallback);
+  }
 }
 
 export async function loadComments(target: CommentTarget, cookie?: string, nextUrl?: string, fetcher: typeof fetch = fetch): Promise<CommentPage> {

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { commentTarget, commentUrl, loadComments, parseComments, validateCommentPage } from '../comments';
+import { commentTarget, commentUrl, loadComments, parseComments, validateCommentPage, replyUrl, validateReplyPage, parseReplies, loadReplies } from '../comments';
 import { Article, parseLink } from '../model';
 import { renderArticle } from '../render';
 
@@ -42,4 +42,32 @@ test('comment content and authors are sanitized just like article content', () =
   } } });
   assert.match(html, /查看评论|刷新评论/); assert.match(html, /评论 · 已加载 1 条/);
   assert.doesNotMatch(html, /<script>evil|<p onclick|<img onerror/);
+});
+test('reply cursors stay scoped to the selected root comment', () => {
+  assert.match(replyUrl('123'), /comment_v5\/comment\/123\/child_comment/);
+  assert.match(replyUrl('123', true), /comments\/123\/child_comments/);
+  for (const url of ['https://evil.com/api/v4/comment_v5/comment/123/child_comment', 'https://www.zhihu.com/api/v4/comment_v5/comment/999/child_comment', 'https://user@www.zhihu.com/api/v4/comment_v5/comment/123/child_comment', 'https://www.zhihu.com/api/v4/me']) assert.equal(validateReplyPage(url, '123'), undefined);
+  assert.throws(() => replyUrl('../me'), /无效/);
+  assert.match(validateReplyPage('http://www.zhihu.com/api/v4/comment_v5/comment/123/child_comment?offset=opaque', '123')!, /^https:/);
+});
+test('reply parsing preserves IDs, reply context and subsequent pages', () => {
+  const page = parseReplies('{"data":[{"id":1969027955376807936,"content":"楼中楼","author":{"member":{"name":"乙"}},"reply_to_author":{"member":{"name":"甲"}}}],"paging":{"is_end":false,"next":"/api/v4/comment_v5/comment/123/child_comment?offset=next"}}', '123', replyUrl('123'));
+  assert.equal(page.items[0].id, '1969027955376807936'); assert.equal(page.items[0].replyTo, '甲'); assert.match(page.nextUrl!, /offset=next/);
+});
+test('replies use modern endpoint, legacy fallback and validate pagination before fetching', async () => {
+  const urls: string[] = [];
+  const fetcher = (async (input: unknown, options: RequestInit) => {
+    urls.push(String(input)); assert.equal((options.headers as Record<string, string>).Cookie, 'session=test');
+    return urls.length === 1 ? new Response('', { status: 403 }) : new Response('{"data":[{"id":"2","content":"回复"}],"paging":{"is_end":true}}');
+  }) as typeof fetch;
+  assert.equal((await loadReplies('123', 'session=test', undefined, fetcher)).items.length, 1);
+  assert.match(urls[1], /\/comments\/123\/child_comments/);
+  await assert.rejects(loadReplies('123', 'session=test', 'https://evil.com', fetcher), /无效/); assert.equal(urls.length, 2);
+});
+test('reply display offers expansion, pagination and retry controls with root identifiers', () => {
+  const root = { id: '101', author: '甲', html: '评论', children: [], moreReplies: 3 };
+  const initial = renderArticle(article, { images: false, fontSize: 15, saved: false, comments: { '0': { items: [root] } } });
+  assert.match(initial, /data-action="replies" data-section="0" data-comment="101"/);
+  const expanded = renderArticle(article, { images: false, fontSize: 18, saved: false, comments: { '0': { items: [root], replies: { '101': { items: [], nextUrl: replyUrl('101'), error: '访问受限' } } } } });
+  assert.match(expanded, /加载更多回复/); assert.match(expanded, /重试加载回复/); assert.match(expanded, /访问受限/);
 });

@@ -8,6 +8,46 @@ const platformJson = JSONbig({ storeAsString: true });
 export const ZHIHU_RECOMMEND_URL = 'https://www.zhihu.com/api/v3/feed/topstory/recommend?desktop=true&limit=20&action=down&after_id=0&page_number=1';
 export interface RecommendationPage { entries: Entry[]; nextUrl?: string; }
 
+export const TIEBA_HOME_FEED = 'https://tieba.baidu.com/f/index/feedlist';
+export function tiebaHomeUrl(page = 1, lastTid?: string): string {
+  if (!Number.isSafeInteger(page) || page < 1 || page > 100000) throw new Error('无效的贴吧首页页码。');
+  const url = new URL(TIEBA_HOME_FEED);
+  url.searchParams.set('is_new', '1');
+  url.searchParams.set('tag_id', 'like');
+  url.searchParams.set('pn', String(page));
+  if (lastTid && /^\d+$/.test(lastTid)) url.searchParams.set('last_tid', lastTid);
+  return url.href;
+}
+export function tiebaHomePage(input?: string): number {
+  if (!input) return 1;
+  const url = assertSiteUrl(input, 'tieba');
+  const page = Number(url.searchParams.get('pn'));
+  if (url.pathname !== '/f/index/feedlist' || !Number.isSafeInteger(page) || page < 1 || page > 100000) throw new Error('无效的贴吧首页分页地址。');
+  return page;
+}
+
+export function parseTiebaHome(body: string, page = 1): RecommendationPage {
+  const result = platformJson.parse(body);
+  if ((result.no !== undefined && Number(result.no) !== 0) || !result.data || typeof result.data.html !== 'string') throw new PlatformError('贴吧首页接口未返回推荐列表。');
+  const $ = cheerio.load(result.data.html), cards = $('.j_feed_li');
+  const parsed = new Map<string, Entry>();
+  cards.each((_, element) => {
+    const card = $(element);
+    if (card.hasClass('home-place-item')) return;
+    const link = card.find('.thread-name-wraper a, a.feed-item-link').first();
+    const title = link.attr('title')?.trim() || link.text().trim();
+    if (!title) return;
+    try {
+      const entry = parseLink(new URL(link.attr('href') || '', 'https://tieba.baidu.com/').href);
+      if (entry.site !== 'tieba') return;
+      const forum = card.find('.feed-forum-link, .n_name').first();
+      parsed.set(entry.id, { ...entry, title, summary: card.find('.n_txt').text().trim(), description: forum.attr('title') || forum.text().trim() || undefined });
+    } catch { /* Ignore unsupported cards rather than collecting unrelated links. */ }
+  });
+  const entries = cards.length ? [...parsed.values()] : parseTiebaList(result.data.html);
+  return { entries, nextUrl: result.data.has_more === true || result.data.has_more === 1 || result.data.has_more === '1' ? tiebaHomeUrl(page + 1, result.data.last_tid == null ? undefined : String(result.data.last_tid)) : undefined };
+}
+
 export function validateRecommendationUrl(input: string): string | undefined {
   try {
     const url = new URL(input, ZHIHU_RECOMMEND_URL);
@@ -48,13 +88,14 @@ export function parseRecommendations(body: string, currentUrl = ZHIHU_RECOMMEND_
   return { entries: [...entries.values()], nextUrl };
 }
 
-export async function request(url: string, site: Site, cookie?: string, fetcher: typeof fetch = fetch): Promise<string> {
+export async function request(url: string, site: Site, cookie?: string, fetcher: typeof fetch = fetch, userAgent?: string): Promise<string> {
   assertSiteUrl(url, site);
   const response = await fetcher(url, {
     redirect: 'manual', signal: AbortSignal.timeout(18000),
-    headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json,text/html;q=0.9', ...(cookie ? { Cookie: cookie } : {}) }
+    headers: { 'User-Agent': userAgent?.trim() || USER_AGENT, 'Accept': 'application/json,text/html;q=0.9',
+      ...(site === 'tieba' ? { 'Referer': 'https://tieba.baidu.com/', 'Accept-Language': 'zh-CN,zh;q=0.9' } : {}), ...(cookie ? { Cookie: cookie } : {}) }
   });
-  if ([301, 302, 303, 307, 308, 401, 403, 429].includes(response.status)) throw new PlatformError('平台要求登录或安全验证。请在浏览器完成验证，再设置 Cookie 后重试；Cookie 也可能无法解除访问限制。');
+  if ([301, 302, 303, 307, 308, 401, 403, 429].includes(response.status)) throw new PlatformError(`平台要求登录或安全验证（${site === 'tieba' ? '贴吧' : '知乎'}，HTTP ${response.status}）。请在浏览器完成验证后重试；Cookie 也可能无法解除访问限制。`);
   if (!response.ok) throw new Error(`平台请求失败（HTTP ${response.status}）。`);
   // Bound responses before parsing or storing them.
   const reader = response.body?.getReader();
@@ -67,7 +108,7 @@ export async function request(url: string, site: Site, cookie?: string, fetcher:
     chunks.push(value);
   }
   const body = Buffer.concat(chunks).toString('utf8');
-  if (/百度安全验证|<title>[^<]*(?:安全验证|登录知乎)|"name"\s*:\s*"AuthenticationError"/i.test(body)) throw new PlatformError('平台返回安全验证页面。请在原站完成验证，或更新 Cookie。');
+  if (/百度安全验证|<title>[^<]*(?:安全验证|登录知乎)|"name"\s*:\s*"AuthenticationError"/i.test(body)) throw new PlatformError(`平台返回安全验证页面（HTTP ${response.status}）。请在原站完成验证，或更新 Cookie。`);
   return body;
 }
 
@@ -95,26 +136,62 @@ export function parseZhihuList(body: string): Entry[] {
   });
 }
 
+export function validateTiebaPage(input: string, entry: Entry): string | undefined {
+  try {
+    const canonical = parseLink(entry.url);
+    if (canonical.site !== 'tieba') return;
+    const id = new URL(canonical.url).pathname.split('/').pop()!;
+    const url = new URL(input, canonical.url);
+    if (!['https:', 'http:'].includes(url.protocol) || url.hostname !== 'tieba.baidu.com' || url.username || url.password || url.port) return;
+    const pn = url.searchParams.get('pn');
+    if (pn !== null && !/^\d{1,9}$/.test(pn)) return;
+    if (url.pathname === `/p/${id}`) return `https://tieba.baidu.com/p/${id}${pn === null ? '' : `?pn=${pn}`}`;
+    if (url.pathname === '/mo/q/m' && url.searchParams.get('kz') === id) return `https://tieba.baidu.com/mo/q/m?kz=${id}${pn === null ? '' : `&pn=${pn}`}`;
+  } catch { return; }
+}
+
 export function parseTiebaArticle(html: string, entry: Entry, pageUrl = entry.url): Article {
-  const $ = cheerio.load(html);
+  const $ = cheerio.load(html.replace(/<!--([\s\S]*?)-->/g, (_, content: string) => /d_post_content|class=["'][^"']*l_post/.test(content) ? content : ''));
   const sections: Article['sections'] = [];
+  const readable = (content: ReturnType<typeof $>) => content.text().trim() || content.find('img').length;
+  const metadata = (raw?: string) => { try { return raw ? platformJson.parse(raw) : {}; } catch { return {}; } };
   $('.l_post').each((_, el) => {
     const node = $(el), content = node.find('.d_post_content');
-    if (content.length) sections.push({ author: node.find('.p_author_name').first().text().trim() || '吧友', html: content.html() || '' });
+    const data = metadata(node.attr('data-field'));
+    if (content.length && readable(content)) sections.push({ id: data.content?.post_id ? String(data.content.post_id) : content.attr('id'), author: node.find('.p_author_name').first().text().trim() || data.author?.user_name || '吧友', html: content.html() || '' });
   });
-  if (!sections.length) $('.content').each((_, el) => {
-    if ($(el).text().trim()) sections.push({ author: '吧友', html: $(el).html() || '' });
+  // Some desktop responses omit the surrounding floor container.
+  if (!sections.length) $('.d_post_content').each((_, el) => {
+    const content = $(el);
+    if (readable(content)) sections.push({ id: content.attr('id'), author: '吧友', html: content.html() || '' });
   });
-  if (!sections.length) throw new Error('没有解析到帖子正文，页面可能需要验证或结构已变化。');
-  const next = $('a').filter((_, el) => $(el).text().trim() === '下一页').first().attr('href');
+  if (!sections.length) $('.floor, .post-item, .list_item, .p_postlist > li').each((_, el) => {
+    const floor = $(el), content = floor.find('.content-text, .post-content, .content').first();
+    if (content.length && readable(content)) sections.push({ author: floor.find('.user_name, .username, .author, .p_author_name').first().text().trim() || '吧友', html: content.html() || '' });
+  });
+  // Legacy WAP floors are .i blocks with a user link and a floor marker.
+  if (!sections.length) $('.i').each((_, el) => {
+    const floor = $(el);
+    if (!/\d+\s*楼/.test(floor.text())) return;
+    const author = floor.find('a[href*="un="], a[href*="/home"], .user_name').first();
+    if (!author.length) return;
+    const content = floor.clone(); content.find('script,style,form,.reply,.floor-info').remove();
+    sections.push({ author: author.text().trim() || '吧友', html: content.html() || '' });
+  });
+  if (!sections.length) {
+    const text = $('body').text();
+    if (/帖子不存在|贴子不存在|帖子已被删除|贴子已被删除|该贴已被删除|您要浏览的贴子暂时无法显示/.test(text)) throw new PlatformError('贴吧返回帖子不存在、已删除或当前账号不可见的提示。');
+    throw new PlatformError('贴吧页面未返回可识别的正文楼层，可能是需浏览器运行脚本的页面、访问限制或页面结构变化。');
+  }
+  const next = $('a[rel="next"], a').filter((_, el) => $(el).attr('rel') === 'next' || /^下[一]?页(?:[>›»→]*)$/.test($(el).text().trim())).first().attr('href');
   let nextUrl: string | undefined;
   if (next) {
     try {
-      const url = assertSiteUrl(new URL(next, pageUrl).href, 'tieba');
-      if (url.pathname === new URL(entry.url).pathname && /^\d+$/.test(url.searchParams.get('pn') || '')) nextUrl = url.href;
-    } catch { /* Ignore unrelated navigation. */ }
+      const normalized = validateTiebaPage(new URL(next, pageUrl).href, entry);
+      if (normalized && Number(new URL(normalized).searchParams.get('pn')) > Number(new URL(pageUrl).searchParams.get('pn') || 0)) nextUrl = normalized;
+    } catch { /* A broken next link must not discard readable floors. */ }
   }
-  return { ...entry, title: $('h3.core_title_txt').text().trim() || $('title').text().replace(/_.*$/, '').trim() || entry.title, sections, nextUrl, fetchedAt: Date.now() };
+  return { ...entry, title: $('h3.core_title_txt, h1, .thread_title, .ti_title').first().text().trim() || $('title').text().replace(/_.*$/, '').trim() || entry.title, sections, nextUrl, fetchedAt: Date.now() };
 }
 
 export function parseZhihuArticle(html: string, entry: Entry): Article {
@@ -142,7 +219,25 @@ export function parseZhihuArticle(html: string, entry: Entry): Article {
 }
 
 export class Providers {
-  constructor(private readonly cookie: (site: Site) => Promise<string | undefined>, private readonly fetcher: typeof fetch = (...args) => fetch(...args)) {}
+  constructor(private readonly cookie: (site: Site) => Promise<string | undefined>, private readonly fetcher: typeof fetch = (...args) => fetch(...args), private readonly tiebaUserAgent: () => string | undefined = () => undefined) {}
+  async tiebaHome(pageUrl?: string): Promise<RecommendationPage> {
+    const page = tiebaHomePage(pageUrl), cookie = await this.cookie('tieba');
+    const lastTid = pageUrl ? new URL(pageUrl).searchParams.get('last_tid') || undefined : undefined;
+    let apiError: unknown;
+    try {
+      const result = parseTiebaHome(await request(tiebaHomeUrl(page, lastTid), 'tieba', cookie, this.fetcher, this.tiebaUserAgent()), page);
+      if (!result.entries.length) throw new PlatformError('本批未返回可读推荐，可能需要登录或首页只提供动态内容。');
+      return result;
+    } catch (error) { apiError = error; }
+    if (page > 1) throw apiError;
+    try {
+      const entries = parseTiebaList(await request('https://tieba.baidu.com/', 'tieba', cookie, this.fetcher, this.tiebaUserAgent()));
+      if (!entries.length) throw new PlatformError('首页网页没有可读帖子。');
+      return { entries };
+    } catch (error) {
+      throw new PlatformError(`贴吧首页推荐加载失败。接口：${apiError instanceof Error ? apiError.message : '请求失败'} 网页：${error instanceof Error ? error.message : '请求失败'} 请检查贴吧登录状态及安全验证。`);
+    }
+  }
   async recommendations(pageUrl = ZHIHU_RECOMMEND_URL): Promise<RecommendationPage> {
     const url = validateRecommendationUrl(pageUrl);
     if (!url) throw new Error('无效的知乎推荐分页地址。');
@@ -151,19 +246,48 @@ export class Providers {
     return parseRecommendations(await request(url, 'zhihu', cookie, this.fetcher), url);
   }
   async list(site: Site, forum?: string, page = 0): Promise<Entry[]> {
-    const url = site === 'tieba'
-      ? `https://tieba.baidu.com/f?kw=${encodeURIComponent(forum || '图拉丁')}&ie=utf-8&pn=${page * 50}`
-      : 'https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=30&desktop=true';
+    if (site === 'tieba') {
+      const cookie = await this.cookie('tieba');
+      const kw = encodeURIComponent(forum || '图拉丁');
+      const urls = [
+        `https://tieba.baidu.com/f?kw=${kw}&ie=utf-8&pn=${page * 50}`,
+        `https://tieba.baidu.com/mo/q/m?kw=${kw}&pn=${page * 50}`
+      ];
+      const errors: string[] = [];
+      for (const [index, url] of urls.entries()) {
+        try {
+          const list = parseTiebaList(await request(url, 'tieba', cookie, this.fetcher, this.tiebaUserAgent()));
+          if (list.length) return list;
+          throw new Error('页面未包含可读帖子列表，可能为验证页面或页面结构已变化。');
+        } catch (error) { errors.push(`${index === 0 ? '桌面版' : '移动版'}：${error instanceof Error ? error.message : '请求失败'}`); }
+      }
+      const login = !cookie?.trim() ? '未设置贴吧 Cookie。' : /(?:^|;\s*)(?:BDUSS|BDUSS_BFESS)=/.test(cookie) ? 'Cookie 已设置，含百度登录字段。' : 'Cookie 已设置，但未发现 BDUSS / BDUSS_BFESS 登录字段，可能只复制了访客 Cookie。';
+      throw new PlatformError(`贴吧列表加载失败。${login} ${errors.join(' ')} 如浏览器可正常浏览，可在设置 hnovaFish.tiebaUserAgent 中填写同一浏览器的 User-Agent；这仍不能保证解除设备验证。`);
+    }
+    const url = 'https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=30&desktop=true';
     const body = await request(url, site, await this.cookie(site), this.fetcher);
-    const list = site === 'tieba' ? parseTiebaList(body) : parseZhihuList(body);
+    const list = parseZhihuList(body);
     if (!list.length) throw new Error('没有获取到帖子，可能是页面结构变化或访问受限。');
     return list;
   }
   async article(entry: Entry, pageUrl?: string): Promise<Article> {
     const cookie = await this.cookie(entry.site);
     if (entry.site === 'tieba') {
-      const html = await request(pageUrl || entry.url, entry.site, cookie, this.fetcher);
-      return parseTiebaArticle(html, entry, pageUrl);
+      const canonical = parseLink(entry.url);
+      const id = new URL(canonical.url).pathname.split('/').pop()!;
+      const validPage = pageUrl ? validateTiebaPage(pageUrl, entry) : undefined;
+      if (pageUrl && !validPage) throw new Error('无效的贴吧正文分页地址。');
+      // Mobile and desktop use different pagination schemes: never guess a
+      // conversion when following subsequent pages.
+      const urls = validPage ? [validPage] : [canonical.url, `https://tieba.baidu.com/mo/q/m?kz=${id}`];
+      const errors: string[] = [];
+      for (const url of urls) {
+        try {
+          const html = await request(url, 'tieba', cookie, this.fetcher, this.tiebaUserAgent());
+          return parseTiebaArticle(html, entry, url);
+        } catch (error) { errors.push(`${new URL(url).pathname.startsWith('/p/') ? '桌面版' : '移动版'}：${error instanceof Error ? error.message : '请求失败'}`); }
+      }
+      throw new PlatformError(`贴吧正文加载失败。${errors.join(' ')} 列表和正文的访问限制可能不同；如两种页面都未返回楼层，需要在原站确认该帖是否可见。`);
     }
     if (pageUrl) {
       const valid = validateZhihuPage(pageUrl, entry);

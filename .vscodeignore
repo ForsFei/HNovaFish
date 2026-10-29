@@ -8,6 +8,7 @@ dist/providers.js
 dist/render.js
 dist/readerScript.js
 dist/comments.js
+dist/forums.js
 .gitignore
 tsconfig.json
 *-sample.html

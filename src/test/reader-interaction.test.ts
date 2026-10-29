@@ -9,6 +9,8 @@ const answer: Article = { ...parseLink('https://www.zhihu.com/question/12/answer
 function createReader(article: Article, postMessage: (message: any) => void) {
   const html = renderArticle(article, { images: false, fontSize: 15, saved: false });
   const dom = new JSDOM(html, { runScripts: 'outside-only', url: 'https://reader.test/' });
+  dom.window.scrollTo = () => {};
+  dom.window.requestAnimationFrame = callback => { callback(0); return 0; };
   (dom.window as any).acquireVsCodeApi = () => ({ getState: () => undefined, setState: () => {}, postMessage });
   const script = dom.window.document.querySelector('script')!;
   new Script(script.textContent!);
@@ -22,8 +24,8 @@ test('every toolbar button actually posts its action when clicked', () => {
   const messages: any[] = [];
   const dom = createReader(answer, message => messages.push(message));
   try {
-    for (const action of ['question', 'save', 'refresh', 'original', 'hide']) dom.window.document.querySelector<HTMLButtonElement>(`button[data-action="${action}"]`)!.click();
-    assert.deepEqual(messages.map(m => m.action), ['question', 'save', 'refresh', 'original', 'hide']);
+    for (const action of ['question', 'fontDown', 'fontUp', 'fontReset', 'save', 'refresh', 'original', 'hide']) dom.window.document.querySelector<HTMLButtonElement>(`button[data-action="${action}"]`)!.click();
+    assert.deepEqual(messages.map(m => m.action), ['question', 'fontDown', 'fontUp', 'fontReset', 'save', 'refresh', 'original', 'hide']);
   } finally { dom.window.close(); }
 });
 
@@ -60,6 +62,7 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
   let dom: JSDOM | undefined, onMessage: (m: any) => Promise<void>, onDispose: () => void;
   let calls = 0, closed = false;
   let provider: any, resolved = false;
+  let fontSize = 15;
   const panel = {
     title: '', show(_preserveFocus?: boolean) { closed = false; },
     dispose() { closed = true; dom?.window.close(); onDispose?.(); },
@@ -67,6 +70,8 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
     webview: {
       set html(html: string) {
         dom?.window.close(); dom = new JSDOM(html, { runScripts: 'outside-only' });
+        dom.window.scrollTo = () => {};
+        dom.window.requestAnimationFrame = callback => { callback(0); return 0; };
         (dom.window as any).acquireVsCodeApi = () => ({ getState: () => undefined, setState: () => {}, postMessage: (m: any) => { pending.push(Promise.resolve(onMessage(m))); } });
         const script = dom.window.document.querySelector('script');
         if (script) dom.window.eval(script.textContent!);
@@ -77,7 +82,12 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
   };
   const mock = {
     EventEmitter: class { event = () => {}; fire() {} dispose() {} }, ViewColumn: { Active: 1 }, ProgressLocation: { Window: 10 },
-    workspace: { getConfiguration: () => ({ get: (_key: string, fallback: unknown) => fallback }), onDidChangeConfiguration: () => ({ dispose() {} }) },
+    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+    workspace: { getConfiguration: () => ({
+      get: (key: string, fallback: unknown) => key === 'fontSize' ? fontSize : fallback,
+      inspect: () => ({}),
+      update: async (key: string, value: number, target: number) => { assert.equal(key, 'fontSize'); assert.equal(target, 1); fontSize = value; }
+    }), onDidChangeConfiguration: () => ({ dispose() {} }) },
     window: {
       registerTreeDataProvider: () => ({ dispose() {} }),
       createWebviewPanel: () => assert.fail('Reading must never open or replace an editor tab'),
@@ -101,7 +111,8 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
   Module._load = function(id: string, ...args: unknown[]) { return id === 'vscode' ? mock : originalLoad.call(this, id, ...args); };
   globalThis.fetch = (async (input: unknown) => {
     calls++; const url = new URL(String(input));
-    if (url.pathname.includes('/root_comment')) return new Response(JSON.stringify({ data: [{ id: url.searchParams.get('offset') === 'next' ? '102' : '101', content: '<p>测试评论</p>', author: { name: '评论作者' } }], paging: { is_end: url.searchParams.get('offset') === 'next', next: '/api/v4/comment_v5/answers/99/root_comment?offset=next' } }));
+    if (url.pathname.includes('/child_comment')) return new Response(JSON.stringify({ data: (url.searchParams.get('offset') === 'next' ? ['202', '203'] : ['201', '202']).map(id => ({ id, content: '<p>楼中楼回复</p>', author: { name: '回复作者' }, reply_to_author: { name: '评论作者' } })), paging: { is_end: url.searchParams.get('offset') === 'next', next: '/api/v4/comment_v5/comment/101/child_comment?offset=next' } }));
+    if (url.pathname.includes('/root_comment')) return new Response(JSON.stringify({ data: [{ id: url.searchParams.get('offset') === 'next' ? '102' : '101', content: '<p>测试评论</p>', author: { name: '评论作者' }, child_comment_count: 3, child_comments: [{ id: '201', content: '<p>楼中楼回复</p>', author: { name: '回复作者' } }] }], paging: { is_end: url.searchParams.get('offset') === 'next', next: '/api/v4/comment_v5/answers/99/root_comment?offset=next' } }));
     const item = (id: string) => ({ id, content: `<p>回答 ${id}</p>`, author: { name: `作者 ${id}` }, question: { id: '12', title: '问题', answer_count: 3 } });
     return new Response(JSON.stringify(url.pathname.includes('/questions/')
       ? { data: url.searchParams.get('offset') === '10' ? [item('3')] : [item('1'), item('2')], paging: { is_end: url.searchParams.get('offset') === '10', next: '/api/v4/questions/12/answers?offset=10' } }
@@ -125,10 +136,19 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
     await click('save'); assert.equal(state.get('saved').length, 0);
     await click('refresh'); assert.equal(calls, 2);
     await click('original'); assert.equal(external[0], answer.url);
-    await click('comments'); assert.equal(calls, 3); assert.equal(dom!.window.document.querySelectorAll('.comment').length, 1);
-    await click('commentsMore'); assert.equal(calls, 4); assert.equal(dom!.window.document.querySelectorAll('.comment').length, 2);
-    await click('question'); assert.equal(calls, 5); assert.equal(dom!.window.document.querySelectorAll('.answer-card').length, 2);
-    await click('next'); assert.equal(calls, 6); assert.equal(dom!.window.document.querySelectorAll('.answer-card').length, 3);
+    await click('comments'); assert.equal(calls, 3); assert.equal(dom!.window.document.querySelectorAll('.comments>details>.comment').length, 1);
+    await click('replies'); assert.equal(calls, 4); assert.equal(dom!.window.document.querySelectorAll('.comment .comment').length, 2);
+    await click('repliesMore'); assert.equal(calls, 5); assert.equal(dom!.window.document.querySelectorAll('.comment .comment').length, 3);
+    await click('fontUp'); assert.equal(fontSize, 16); assert.equal(dom!.window.document.querySelector('button[data-action="fontReset"]')!.textContent, '16px');
+    assert.equal(dom!.window.document.querySelectorAll('.comment .comment').length, 3, 'Changing font preserves loaded replies');
+    for (let i = 0; i < 12; i++) await click('fontUp'); assert.equal(fontSize, 24);
+    await click('fontReset'); assert.equal(fontSize, 15);
+    for (let i = 0; i < 6; i++) await click('fontDown'); assert.equal(fontSize, 12);
+    await click('fontReset'); assert.equal(fontSize, 15); assert.equal(calls, 5, 'Font controls do not reload platform data');
+    await click('commentsMore'); assert.equal(calls, 6); assert.equal(dom!.window.document.querySelectorAll('.comments>details>.comment').length, 2);
+    assert.equal(dom!.window.document.querySelectorAll('.comment .comment').length, 4, 'Loading more root comments preserves previously loaded replies');
+    await click('question'); assert.equal(calls, 7); assert.equal(dom!.window.document.querySelectorAll('.answer-card').length, 2);
+    await click('next'); assert.equal(calls, 8); assert.equal(dom!.window.document.querySelectorAll('.answer-card').length, 3);
     const previousDom = dom;
     await click('hide'); assert.equal(closed, true);
     await commands.get('hnovaFish.focusReader')!();
@@ -136,5 +156,32 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
   } finally {
     subscriptions.forEach(item => item.dispose()); dom?.window.close();
     Module._load = originalLoad; globalThis.fetch = originalFetch;
+  }
+});
+
+test('switching articles explicitly resets inherited scroll, while the same article retains its position', () => {
+  for (const [previousUrl, expected] of [[answer.url, 1800], ['https://tieba.baidu.com/p/123', 0], [undefined, 0]] as const) {
+    const html = renderArticle(answer, { images: false, fontSize: 15, saved: false });
+    const dom = new JSDOM(html, { runScripts: 'outside-only' });
+    const positions: number[] = [], frames: FrameRequestCallback[] = [];
+    let state = { url: previousUrl, scroll: 1800 };
+    dom.window.scrollTo = ((options: ScrollToOptions) => { positions.push(options.top || 0); }) as typeof dom.window.scrollTo;
+    dom.window.requestAnimationFrame = callback => { frames.push(callback); return 0; };
+    (dom.window as any).acquireVsCodeApi = () => ({ getState: () => state, setState: (value: typeof state) => { state = value; }, postMessage: () => {} });
+    try {
+      dom.window.eval(dom.window.document.querySelector('script')!.textContent!);
+      while (frames.length) frames.shift()!(0);
+      dom.window.dispatchEvent(new dom.window.Event('load'));
+      while (frames.length) frames.shift()!(0);
+      assert.ok(positions.length >= 3);
+      assert.ok(positions.every(value => value === expected));
+      assert.equal(state.url, answer.url);
+      assert.equal(state.scroll, expected);
+      dom.window.dispatchEvent(new dom.window.Event('pointerdown'));
+      const count = positions.length;
+      dom.window.dispatchEvent(new dom.window.Event('load'));
+      while (frames.length) frames.shift()!(0);
+      assert.equal(positions.length, count, 'Late load must not override user navigation');
+    } finally { dom.window.close(); }
   }
 });

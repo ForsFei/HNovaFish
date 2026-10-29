@@ -1,7 +1,7 @@
 declare const acquireVsCodeApi: () => {
   getState(): { url?: string; scroll?: number } | undefined;
   setState(state: { url: string; scroll: number }): void;
-  postMessage(message: { action: string; url?: string; section?: number }): void;
+  postMessage(message: { action: string; url?: string; section?: number; comment?: string }): void;
 };
 
 // This function is serialized into the Webview. Keep all dependencies local or
@@ -11,7 +11,17 @@ function initializeReader(): void {
   const pageUrl = document.body.dataset.pageUrl || '';
   const nextLabel = document.body.dataset.nextLabel || '加载更多 →';
   const previous = vscode.getState();
-  if (previous?.url === pageUrl) requestAnimationFrame(() => window.scrollTo(0, previous.scroll || 0));
+  const savedScroll = typeof previous?.scroll === 'number' && Number.isFinite(previous.scroll) ? Math.max(0, previous.scroll) : 0;
+  const initialScroll = previous?.url === pageUrl ? savedScroll : 0;
+  // A reused Webview may retain its old scroll position even when the URL
+  // changes. Explicitly reset both the Webview state and the document position.
+  vscode.setState({ url: pageUrl, scroll: initialScroll });
+  let interacted = false;
+  for (const event of ['wheel', 'pointerdown', 'keydown']) window.addEventListener(event, () => { interacted = true; }, { once: true, passive: true });
+  const restore = () => { if (!interacted) window.scrollTo({ left: 0, top: initialScroll, behavior: 'instant' }); };
+  restore();
+  requestAnimationFrame(() => requestAnimationFrame(restore));
+  window.addEventListener('load', () => requestAnimationFrame(restore), { once: true });
   const remember = () => vscode.setState({ url: pageUrl, scroll: window.scrollY });
   let timer: ReturnType<typeof setTimeout>;
   window.addEventListener('scroll', () => {
@@ -30,7 +40,7 @@ function initializeReader(): void {
     if (button) {
       remember();
       if (button.dataset.action === 'next') { button.disabled = true; button.textContent = '正在加载…'; }
-      vscode.postMessage({ action: button.dataset.action!, ...(button.dataset.section === undefined ? {} : { section: Number(button.dataset.section) }) });
+      vscode.postMessage({ action: button.dataset.action!, ...(button.dataset.section === undefined ? {} : { section: Number(button.dataset.section) }), ...(button.dataset.comment === undefined ? {} : { comment: button.dataset.comment }) });
       return;
     }
     const link = target?.closest<HTMLAnchorElement>('a');
