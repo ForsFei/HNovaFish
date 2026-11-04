@@ -29,6 +29,17 @@ test('every toolbar button actually posts its action when clicked', () => {
   } finally { dom.window.close(); }
 });
 
+test('reader iframe reports actual keyboard focus and resets it on blur', () => {
+  const messages: any[] = [];
+  const dom = createReader(answer, message => messages.push(message));
+  try {
+    dom.window.dispatchEvent(new dom.window.FocusEvent('focus'));
+    dom.window.document.dispatchEvent(new dom.window.Event('pointerdown', { bubbles: true }));
+    dom.window.dispatchEvent(new dom.window.FocusEvent('blur'));
+    assert.deepEqual(messages.map(message => ({ ...message })), [{ action: 'readerFocus', focused: true }, { action: 'readerFocus', focused: false }]);
+  } finally { dom.window.close(); }
+});
+
 test('load more posts once while disabled and recovers on completion', () => {
   const messages: any[] = [];
   const dom = createReader({ ...answer, ...parseLink('https://www.zhihu.com/question/12'), nextUrl: 'https://www.zhihu.com/api/v4/questions/12/answers?offset=10' }, message => messages.push(message));
@@ -63,6 +74,7 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
   let calls = 0, closed = false;
   let provider: any, resolved = false;
   let fontSize = 15;
+  let recoveryReads = 0;
   const panel = {
     title: '', show(_preserveFocus?: boolean) { closed = false; },
     dispose() { closed = true; dom?.window.close(); onDispose?.(); },
@@ -111,6 +123,24 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
   Module._load = function(id: string, ...args: unknown[]) { return id === 'vscode' ? mock : originalLoad.call(this, id, ...args); };
   globalThis.fetch = (async (input: unknown) => {
     calls++; const url = new URL(String(input));
+    if (url.hostname === 'tieba.baidu.com') {
+      if (url.pathname === '/p/456') {
+        recoveryReads++;
+        return new Response(`<div class="l_post" data-field='{"content":{"comment_num":6${recoveryReads > 1 ? ',"post_id":"800"' : ''}}}'><div class="d_post_content">需要恢复的楼层</div></div>`);
+      }
+      if (url.pathname === '/p/totalComment' && url.searchParams.get('tid') === '456') return new Response(JSON.stringify({ data: { comment_list: { '800': { comment_num: 6, comment_info: [] } } } }));
+      if (url.pathname === '/p/comment' && url.searchParams.get('tid') === '456') {
+        assert.equal(url.searchParams.get('pid'), '800');
+        return new Response('<li class="lzl_single_post" data-field=\'{"spid":"801"}\'><span class="lzl_content_main">恢复后的楼中楼</span></li>');
+      }
+      if (url.pathname === '/p/totalComment') return new Response(JSON.stringify({ errno: 0, data: { comment_list: { '900': { comment_num: 2, comment_info: [{ comment_id: '901', username: '吧友', content: '贴吧楼中楼 1' }] } } } }));
+      if (url.pathname === '/p/comment') {
+        assert.equal(url.searchParams.get('tid'), '123'); assert.equal(url.searchParams.get('pid'), '900');
+        const page = url.searchParams.get('pn');
+        return new Response(`<li class="lzl_single_post" data-field='{"spid":"${page === '2' ? '902' : '901'}"}'><div class="lzl_cnt"><a class="j_user_card">吧友</a><span class="lzl_content_main">贴吧楼中楼 ${page}</span></div></li>${page === '1' ? '<div class="lzl_pager"><a href="#2">下一页</a></div>' : ''}`);
+      }
+      return new Response('<div class="l_post" data-field=\'{"content":{"post_id":"900"}}\'><div class="d_post_content">贴吧正文</div></div>');
+    }
     if (url.pathname.includes('/child_comment')) return new Response(JSON.stringify({ data: (url.searchParams.get('offset') === 'next' ? ['202', '203'] : ['201', '202']).map(id => ({ id, content: '<p>楼中楼回复</p>', author: { name: '回复作者' }, reply_to_author: { name: '评论作者' } })), paging: { is_end: url.searchParams.get('offset') === 'next', next: '/api/v4/comment_v5/comment/101/child_comment?offset=next' } }));
     if (url.pathname.includes('/root_comment')) return new Response(JSON.stringify({ data: [{ id: url.searchParams.get('offset') === 'next' ? '102' : '101', content: '<p>测试评论</p>', author: { name: '评论作者' }, child_comment_count: 3, child_comments: [{ id: '201', content: '<p>楼中楼回复</p>', author: { name: '回复作者' } }] }], paging: { is_end: url.searchParams.get('offset') === 'next', next: '/api/v4/comment_v5/answers/99/root_comment?offset=next' } }));
     const item = (id: string) => ({ id, content: `<p>回答 ${id}</p>`, author: { name: `作者 ${id}` }, question: { id: '12', title: '问题', answer_count: 3 } });
@@ -153,6 +183,19 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
     await click('hide'); assert.equal(closed, true);
     await commands.get('hnovaFish.focusReader')!();
     assert.equal(closed, false); assert.equal(dom, previousDom, 'Hiding the sidebar retains the reader DOM');
+    await commands.get('hnovaFish.read')!(parseLink('https://tieba.baidu.com/p/123'));
+    assert.equal(dom!.window.document.querySelector('button[data-action="comments"]')!.textContent, '展开剩余 1 条回复');
+    assert.match(dom!.window.document.body.textContent!, /贴吧楼中楼 1/);
+    await click('comments');
+    assert.match(dom!.window.document.body.textContent!, /贴吧楼中楼 1/);
+    await click('commentsMore');
+    assert.equal(dom!.window.document.querySelectorAll('.tieba-replies>.comment').length, 2);
+    assert.match(dom!.window.document.body.textContent!, /贴吧楼中楼 2/);
+    assert.equal(dom!.window.document.querySelector('button[data-action="commentsMore"]'), null, 'No more button after the final reply');
+    await commands.get('hnovaFish.read')!(parseLink('https://tieba.baidu.com/p/456'));
+    assert.match(dom!.window.document.body.textContent!, /重新识别并展开 6 条回复/);
+    await click('recoverReplies');
+    assert.match(dom!.window.document.body.textContent!, /恢复后的楼中楼/);
   } finally {
     subscriptions.forEach(item => item.dispose()); dom?.window.close();
     Module._load = originalLoad; globalThis.fetch = originalFetch;

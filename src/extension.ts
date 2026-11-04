@@ -4,9 +4,10 @@ import { Providers } from './providers';
 import { renderArticle, renderEmptyReader } from './render';
 import { CommentView, commentTarget, loadComments, loadReplies } from './comments';
 import { forumName } from './forums';
+import { tiebaCommentTarget, loadTiebaComments, loadTiebaPreviews } from './tiebaComments';
 
 type Node = { kind: 'group'; title: string; source: 'tieba' | 'tiebaHome' | 'zhihu' | 'recommend' | 'saved' | 'history'; forum?: string }
-  | { kind: 'entry'; entry: Entry }
+  | { kind: 'entry'; entry: Entry; source?: string }
   | { kind: 'more'; group: Extract<Node, {kind: 'group'}> }
   | { kind: 'error'; message: string; url: string }
   | { kind: 'notice'; message: string }
@@ -18,12 +19,14 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(changes);
   const entries = (key: string) => context.globalState.get<Entry[]>(key, []);
   const lists = new Map<string, Entry[]>();
-  const pages = new Map<string, number>();
   const recommendationNext = new Map<string, string>();
   const loadingLists = new Set<string>();
   let listGeneration = 0;
   let browsingForum: string | undefined;
-  function resetLists() { listGeneration++; lists.clear(); pages.clear(); recommendationNext.clear(); changes.fire(); }
+  let navigation: { key: string; items: Entry[]; selectedId: string } | undefined;
+  let navigating = false;
+  let navigationRun = 0;
+  function resetLists() { listGeneration++; lists.clear(); recommendationNext.clear(); changes.fire(); }
   const config = () => vscode.workspace.getConfiguration('hnovaFish');
   const groupKey = (node: Extract<Node, {kind: 'group'}>) => `${node.source}:${node.forum || ''}`;
   const tree: vscode.TreeDataProvider<Node> = {
@@ -36,7 +39,8 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       if (node.kind === 'more') {
         const recommended = node.group.source === 'recommend' || node.group.source === 'tiebaHome';
-        const item = new vscode.TreeItem(recommended ? '刷新推荐 · 换一批' : '加载更多帖子…'); item.command = { command: 'hnovaFish.more', title: recommended ? '刷新推荐' : '加载更多', arguments: [node.group] }; return item;
+        const label = recommended ? '刷新推荐 · 换一批' : node.group.source === 'zhihu' ? '刷新热榜' : '刷新帖子列表';
+        const item = new vscode.TreeItem(label); item.iconPath = new vscode.ThemeIcon('refresh'); item.command = { command: 'hnovaFish.more', title: label, arguments: [node.group] }; return item;
       }
       if (node.kind === 'action') {
         const item = new vscode.TreeItem(node.title); item.iconPath = new vscode.ThemeIcon(node.command === 'browseForum' ? 'search' : 'star');
@@ -53,7 +57,7 @@ export function activate(context: vscode.ExtensionContext): void {
       item.description = node.entry.description;
       item.tooltip = `${node.entry.title}\n${node.entry.summary || node.entry.url}`;
       item.iconPath = new vscode.ThemeIcon('file-text');
-      item.command = { command: 'hnovaFish.read', title: '阅读', arguments: [node.entry] }; return item;
+      item.command = { command: 'hnovaFish.read', title: '阅读', arguments: [node.entry, false, undefined, node.source] }; return item;
     },
     async getChildren(node): Promise<Node[]> {
       if (!node) return [
@@ -66,7 +70,7 @@ export function activate(context: vscode.ExtensionContext): void {
         { kind: 'group', title: '本机收藏', source: 'saved' }, { kind: 'group', title: '阅读历史', source: 'history' }
       ];
       if (node.kind !== 'group') return [];
-      if (node.source === 'saved' || node.source === 'history') return entries(node.source).map(entry => ({ kind: 'entry', entry }));
+      if (node.source === 'saved' || node.source === 'history') return entries(node.source).map(entry => ({ kind: 'entry', entry, source: groupKey(node) }));
       const key = groupKey(node);
       try {
         const ticket = listGeneration;
@@ -82,13 +86,13 @@ export function activate(context: vscode.ExtensionContext): void {
             lists.set(key, result);
           }
         }
-        const children: Node[] = lists.get(key)!.map(entry => ({ kind: 'entry', entry }));
+        const children: Node[] = lists.get(key)!.map(entry => ({ kind: 'entry', entry, source: key }));
         if (!children.length && (node.source === 'recommend' || node.source === 'tiebaHome')) children.push({ kind: 'notice', message: '本批没有可读推荐（视频、广告等已略过）' });
         if (node.source === 'tieba' && node.forum && node.forum === browsingForum && !config().get<string[]>('forums', []).includes(node.forum)) {
           children.push({ kind: 'action', title: '收藏这个贴吧', command: 'pinForum', forum: node.forum });
           children.push({ kind: 'action', title: '关闭临时浏览', command: 'closeBrowseForum' });
         }
-        if (node.source === 'tieba' || node.source === 'recommend' || node.source === 'tiebaHome') children.push({ kind: 'more', group: node });
+        children.push({ kind: 'more', group: node });
         return children;
       } catch (error) {
         return [{ kind: 'error', message: errorMessage(error), url: node.source === 'tiebaHome' ? 'https://tieba.baidu.com/' : node.source === 'recommend' ? 'https://www.zhihu.com/' : node.source === 'zhihu' ? 'https://www.zhihu.com/hot' : `https://tieba.baidu.com/f?kw=${encodeURIComponent(node.forum || '')}` }];
@@ -126,16 +130,21 @@ export function activate(context: vscode.ExtensionContext): void {
     if (current?.id !== article.id) commentViews = {};
     current = article; cached = fromCache;
     if (!reader) await vscode.commands.executeCommand('hnovaFish.reader.focus');
-    else reader.show(true);
+    else reader.show(false);
     draw();
   }
   context.subscriptions.push(vscode.window.registerWebviewViewProvider('hnovaFish.reader', {
     resolveWebviewView(view) {
       reader = view;
       view.webview.options = { enableScripts: true, localResourceRoots: [] };
-      view.onDidDispose(() => { if (reader === view) { reader = undefined; generation++; } }, null, context.subscriptions);
+      view.onDidDispose(() => { if (reader === view) { reader = undefined; generation++; void vscode.commands.executeCommand('setContext', 'hnovaFish.readerFocused', false); } }, null, context.subscriptions);
+      view.onDidChangeVisibility?.(() => { if (!view.visible) void vscode.commands.executeCommand('setContext', 'hnovaFish.readerFocused', false); }, null, context.subscriptions);
       view.webview.onDidReceiveMessage(async (message: unknown) => {
-        if (!current || !message || typeof message !== 'object') return;
+        if (!message || typeof message !== 'object') return;
+        if ('action' in message && message.action === 'readerFocus' && 'focused' in message && typeof message.focused === 'boolean') {
+          await vscode.commands.executeCommand('setContext', 'hnovaFish.readerFocused', message.focused); return;
+        }
+        if (!current) return;
         const { action, url, section, comment } = message as { action?: string; url?: string; section?: number; comment?: string };
         try {
           if (action === 'fontDown' || action === 'fontUp' || action === 'fontReset') {
@@ -150,6 +159,7 @@ export function activate(context: vscode.ExtensionContext): void {
           }
           if ((action === 'replies' || action === 'repliesMore') && typeof section === 'number' && typeof comment === 'string') { await readReplies(section, comment, action === 'repliesMore'); return; }
           if ((action === 'comments' || action === 'commentsMore') && typeof section === 'number') { await readComments(section, action === 'commentsMore'); return; }
+          if (action === 'recoverReplies' && typeof section === 'number') { await recoverReplies(section); return; }
           if (action === 'hide') { await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar'); return; }
           if (action === 'original') { await external(current.url); return; }
           if (action === 'link' && typeof url === 'string') { await external(url); return; }
@@ -170,21 +180,36 @@ export function activate(context: vscode.ExtensionContext): void {
       draw();
     }
   }, { webviewOptions: { retainContextWhenHidden: true } }));
+  async function recoverReplies(index: number) {
+    const article = current, floor = article?.sections[index];
+    if (!article || article.site !== 'tieba' || !floor) return;
+    const ticket = generation + 1;
+    await read(article, true);
+    if (generation !== ticket || current?.id !== article.id) return;
+    const matches = current.sections.map((section, i) => ({ section, i })).filter(({ section }) =>
+      floor.id && section.id === floor.id || section.html === floor.html && section.author === floor.author);
+    if (matches.length === 1 && tiebaCommentTarget(current, matches[0].i)) { await readComments(matches[0].i, false); return; }
+    const choice = await vscode.window.showWarningMessage('贴吧返回了回复条数，但没有可用的楼层 ID，暂时无法准确定位这些楼中楼。请查看原文。', '查看原文');
+    if (choice === '查看原文') await external(article.url);
+  }
   async function readComments(index: number, more: boolean) {
     const article = current;
     if (!article) return;
-    const target = commentTarget(article, index), key = String(index), previous = commentViews[key];
-    if (!target || previous?.loading || (more && !previous?.nextUrl)) return;
+    const target = commentTarget(article, index), tiebaTarget = tiebaCommentTarget(article, index), key = String(index), previous = commentViews[key];
+    if ((!target && !tiebaTarget) || previous?.loading || (more && !previous?.nextUrl)) return;
     const ticket = generation;
-    commentViews[key] = { ...(previous || { items: [] }), loading: true, error: undefined }; draw();
+    const initial = { items: article.sections[index].tiebaReplyPreview || [], total: article.sections[index].tiebaReplyCount };
+    commentViews[key] = { ...(previous || initial), loading: true, error: undefined }; draw();
     try {
-      const page = await loadComments(target, await context.secrets.get('cookie.zhihu'), more ? previous?.nextUrl : undefined);
+      const page = tiebaTarget
+        ? await loadTiebaComments(tiebaTarget, await context.secrets.get('cookie.tieba'), more ? previous?.nextUrl : undefined, (...args) => fetch(...args), config().get<string>('tiebaUserAgent'))
+        : await loadComments(target!, await context.secrets.get('cookie.zhihu'), more ? previous?.nextUrl : undefined);
       if (ticket !== generation || current !== article) return;
       const items = more ? [...new Map([...(previous?.items || []), ...page.items].map(item => [item.id, item])).values()] : page.items;
-      commentViews[key] = { ...page, items, total: page.total ?? previous?.total, replies: more ? previous?.replies : undefined };
+      commentViews[key] = { ...page, items, total: page.total ?? previous?.total ?? initial.total, replies: more ? previous?.replies : undefined };
     } catch (error) {
       if (ticket !== generation || current !== article) return;
-      commentViews[key] = { ...(previous || { items: [] }), loading: false, error: `评论加载失败：${errorMessage(error)}` };
+      commentViews[key] = { ...(previous || initial), loading: false, error: `评论加载失败：${errorMessage(error)}` };
     } finally {
       if (ticket === generation && current === article) draw();
     }
@@ -209,7 +234,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (ticket === generation && current === article && commentViews[String(index)]?.replies === views) draw();
     }
   }
-  async function read(entry: Entry, fresh = false, nextUrl?: string) {
+  async function read(entry: Entry, fresh = false, nextUrl?: string, source?: string) {
     if (nextUrl && loadingNext) return;
     // Validate command arguments as well as manually entered links.
     const validated = parseLink(entry.url);
@@ -217,22 +242,38 @@ export function activate(context: vscode.ExtensionContext): void {
     const ticket = ++generation;
     for (const view of Object.values(commentViews)) { view.loading = false; for (const replies of Object.values(view.replies || {})) replies.loading = false; }
     const previous = current;
+    const selectNavigation = () => {
+      if (source) {
+        // Keep history order stable even though reading moves an item to the top.
+        const items = navigating && source === navigation?.key && (source === 'history:' || source === 'saved:') ? navigation.items
+          : source === 'history:' ? entries('history') : source === 'saved:' ? entries('saved') : lists.get(source);
+        navigation = items?.some(item => item.id === entry.id) ? { key: source, items: [...items], selectedId: entry.id } : undefined;
+      } else if (!fresh && !nextUrl) {
+        const sameQuestion = previous?.questionUrl === entry.url || previous?.url.match(/^https:\/\/www\.zhihu\.com\/question\/\d+/)?.[0] === entry.url;
+        if (!sameQuestion) navigation = undefined;
+      }
+    };
     const stored = context.globalState.get<Article[]>('articles', []).find(a => a.id === entry.id);
     const legacyQuestionCache = entry.site === 'zhihu' && /^\/question\/\d+\/?$/.test(new URL(entry.url).pathname) && !stored?.kind;
-    if (stored && !fresh && !legacyQuestionCache) { await show(stored, true); await record(stored); return; }
+    const legacyTiebaCache = entry.site === 'tieba' && stored && stored.tiebaPreviewVersion !== 2;
+    if (stored && !fresh && !legacyQuestionCache && !legacyTiebaCache) { selectNavigation(); await show(stored, true); await record(stored); return; }
     if (nextUrl) loadingNext = true;
     try {
-      const article = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: '随手读：正在加载正文…' }, () => providers.article(entry, nextUrl));
+      const article = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: '随手读：正在加载正文…' }, async () => {
+        const result = await providers.article(entry, nextUrl);
+        if (result.site === 'tieba') await loadTiebaPreviews(result, await context.secrets.get('cookie.tieba'), nextUrl, (...args) => fetch(...args), config().get<string>('tiebaUserAgent'));
+        return result;
+      });
       if (disposed || ticket !== generation) return;
       if (!nextUrl) commentViews = {};
       if (nextUrl && previous?.id === article.id) {
         article.sections = article.site === 'zhihu' ? mergeSections(previous.sections, article.sections) : [...previous.sections, ...article.sections];
         article.totalAnswers ??= previous.totalAnswers;
       }
-      await show(article, false); await cache(article); await record(article);
+      selectNavigation(); await show(article, false); await cache(article); await record(article);
     } catch (error) {
       if (disposed || ticket !== generation) return;
-      if (stored && !nextUrl) { await show(stored, true); await record(stored); }
+      if (stored && !nextUrl) { selectNavigation(); await show(stored, true); await record(stored); }
       const choice = await vscode.window.showWarningMessage(errorMessage(error), '查看原文', '设置 Cookie');
       if (choice === '查看原文') await external(entry.url);
       if (choice === '设置 Cookie') await vscode.commands.executeCommand('hnovaFish.cookie', entry.site);
@@ -244,6 +285,33 @@ export function activate(context: vscode.ExtensionContext): void {
     try { await handler(...args); } catch (error) { void vscode.window.showErrorMessage(errorMessage(error)); }
   }));
   command('read', read);
+  async function navigate(direction: number) {
+    if (navigating || !navigation || !current) return;
+    const items = lists.get(navigation.key) || navigation.items;
+    const index = items.findIndex(item => item.id === navigation!.selectedId);
+    const entry = index < 0 ? undefined : items[index + direction];
+    if (!entry) return;
+    navigating = true;
+    const ticket = ++navigationRun;
+    try { await read(entry, false, undefined, navigation.key); }
+    finally { if (ticket === navigationRun) navigating = false; }
+  }
+  command('previousArticle', () => navigate(-1));
+  command('nextArticle', () => navigate(1));
+  command('bossKey', async () => {
+    // Cancel pending reads so a late response cannot reopen the reader.
+    generation++;
+    navigationRun++; navigating = false;
+    for (const view of Object.values(commentViews)) {
+      view.loading = false;
+      for (const replies of Object.values(view.replies || {})) replies.loading = false;
+    }
+    draw();
+    await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+    await vscode.commands.executeCommand('workbench.action.closeSidebar');
+    await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+  });
+  command('configureShortcuts', () => vscode.commands.executeCommand('workbench.action.openGlobalKeybindings', '@ext:hnova.hnova-fish'));
   command('external', external);
   command('loadError', async (message: string, url: string) => {
     const choice = await vscode.window.showWarningMessage(message, '打开原站', '设置 Cookie');
@@ -269,11 +337,15 @@ export function activate(context: vscode.ExtensionContext): void {
       } finally { loadingLists.delete(key); }
       return;
     }
-    if (group.source !== 'tieba') return;
-    const key = groupKey(group), page = (pages.get(key) || 0) + 1;
-    const more = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: '随手读：加载更多帖子…' }, () => providers.list('tieba', group.forum, page));
-    lists.set(key, [...new Map([...(lists.get(key) || []), ...more].map(e => [e.id, e])).values()]);
-    pages.set(key, page); changes.fire();
+    if (group.source !== 'tieba' && group.source !== 'zhihu') return;
+    const key = groupKey(group), ticket = listGeneration;
+    if (loadingLists.has(key)) return;
+    loadingLists.add(key);
+    try {
+      const result = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: group.source === 'zhihu' ? '随手读：刷新热榜…' : '随手读：刷新帖子列表…' }, () => providers.list(group.source as 'tieba' | 'zhihu', group.forum));
+      if (ticket !== listGeneration) return;
+      lists.set(key, result); changes.fire();
+    } finally { loadingLists.delete(key); }
   });
   command('openUrl', async () => {
     const url = await vscode.window.showInputBox({ title: '阅读帖子链接', prompt: '贴吧帖子 / 知乎问题、回答、专栏文章', placeHolder: 'https://tieba.baidu.com/p/…', ignoreFocusOut: true,
@@ -298,7 +370,7 @@ export function activate(context: vscode.ExtensionContext): void {
     if (mode.mode === 'permanent') await pinForum(name);
     const previous = browsingForum;
     browsingForum = name;
-    if (previous && previous !== browsingForum && !config().get<string[]>('forums', []).includes(previous)) { lists.delete(`tieba:${previous}`); pages.delete(`tieba:${previous}`); }
+    if (previous && previous !== browsingForum && !config().get<string[]>('forums', []).includes(previous)) { lists.delete(`tieba:${previous}`); }
     changes.fire();
   });
   async function pinForum(input: string) {

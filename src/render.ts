@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { Article } from './model';
 import { readerScript } from './readerScript';
 import { CommentItem, CommentView, commentTarget } from './comments';
+import { tiebaCommentTarget } from './tiebaComments';
 
 export function escape(value: string): string { return value.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!)); }
 export function renderEmptyReader(): string {
@@ -52,9 +53,24 @@ export function renderArticle(article: Article, options: { images: boolean; font
     return `<div class="comment"><div class="author">${escape(item.author)}${item.replyTo ? ` 回复 ${escape(item.replyTo)}` : ''}${item.votes === undefined ? '' : ` · ${item.votes} 赞`}</div>${safeHtml(item.html, options.images)}${children.length || view ? `<details open><summary>回复 · 已加载 ${children.length} 条</summary>${children.map(child => commentItem(child, section, true)).join('')}${control}</details>` : control}</div>`;
   };
   const comments = (i: number): string => {
-    if (!commentTarget(article, i)) return '';
+    const tieba = article.site === 'tieba';
     const view = options.comments?.[String(i)];
-    return `<div class="comments"><button data-action="comments" data-section="${i}" ${view?.loading ? 'disabled' : ''}>${view ? '刷新评论' : '查看评论'}</button>${view ? `<details open><summary>评论 · 已加载 ${view.items.length} 条${view.total === undefined ? '' : ` / 共 ${view.total} 条`}</summary>${view.error ? `<p class="notice">${escape(view.error)}</p>` : ''}${view.items.map(item => commentItem(item, i)).join('')}${view.loading ? '<p class="meta">正在加载评论…</p>' : !view.items.length && !view.error ? '<p class="meta">暂无可见评论。</p>' : ''}${view.nextUrl ? `<button data-action="commentsMore" data-section="${i}" ${view.loading ? 'disabled' : ''}>加载更多评论 →</button>` : ''}</details>` : ''}</div>`;
+    if (tieba) {
+      const section = article.sections[i];
+      const items = view?.items ?? section.tiebaReplyPreview ?? [];
+      const total = view?.total ?? section.tiebaReplyCount;
+      if (!items.length && !view?.loading && !view?.error && (!total || view)) return '';
+      const remaining = total === undefined ? undefined : Math.max(0, total - items.length);
+      const canLoad = tiebaCommentTarget(article, i) && (!view ? (remaining === undefined || remaining > 0) : view.nextUrl);
+      const recover = !tiebaCommentTarget(article, i) && remaining !== 0 && (total || items.length);
+      const action = view?.nextUrl ? 'commentsMore' : 'comments';
+      const button = view?.loading ? '<p class="meta">正在加载楼中楼…</p>' : recover ? `<button data-action="recoverReplies" data-section="${i}">重新识别并展开${remaining ? ` ${remaining} 条` : ''}回复</button>` : canLoad || view?.error
+        ? `<button data-action="${view?.error ? 'comments' : action}" data-section="${i}">${view?.error ? '重试加载楼中楼' : remaining ? `展开剩余 ${remaining} 条回复` : '展开更多回复'}</button>` : '';
+      return `<div class="comments tieba-replies"><div class="meta">${total === undefined ? '楼中楼' : `共 ${total} 条楼中楼回复`}</div>${items.map(item => commentItem(item, i, true)).join('')}${view?.error ? `<p class="notice">${escape(view.error)}</p>` : ''}${button}</div>`;
+    }
+    if (!commentTarget(article, i)) return '';
+    const label = tieba ? '楼中楼' : '评论';
+    return `<div class="comments"><button data-action="comments" data-section="${i}" ${view?.loading ? 'disabled' : ''}>${view ? '刷新' : '查看'}${label}</button>${view ? `<details open><summary>${label} · 已加载 ${view.items.length} 条${view.total === undefined ? '' : ` / 共 ${view.total} 条`}</summary>${view.error ? `<p class="notice">${escape(view.error)}</p>` : ''}${view.items.map(item => commentItem(item, i)).join('')}${view.loading ? `<p class="meta">正在加载${label}…</p>` : !view.items.length && !view.error ? `<p class="meta">暂无可见${label}。</p>` : ''}${view.nextUrl ? `<button data-action="commentsMore" data-section="${i}" ${view.loading ? 'disabled' : ''}>加载更多${label} →</button>` : ''}</details>` : ''}</div>`;
   };
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https://*.zhimg.com https://*.baidu.com https://*.bdimg.com https://*.baidubcr.com; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
@@ -70,6 +86,6 @@ export function renderArticle(article: Article, options: { images: boolean; font
   ${article.sections.map((s, i) => question
     ? `<section class="answer-card" id="answer-${i}"><details open><summary>回答 ${String(i + 1).padStart(2, '0')} / ${escape(s.author)}${typeof s.votes === 'number' ? ` · ${s.votes} 赞同` : ''} · 点击折叠</summary><div class="answer-body">${safeHtml(s.html, options.images)}</div>${s.url ? `<a href="${escape(s.url)}">查看这条回答的原文 ↗</a>` : ''}${comments(i)}</details></section>`
     : `<section><div class="author">${String(i + 1).padStart(2, '0')} / ${escape(s.author)}</div>${safeHtml(s.html, options.images)}${comments(i)}</section>`).join('')}
-  ${article.nextUrl ? `<button class="load-more" data-action="next">${question ? '加载更多回答' : '下一页回复'} →</button>` : ''}<p class="meta end-note">${question ? '回答按知乎默认顺序展示，仅展示当前登录可获取的内容。' : '仅展示平台返回的内容，楼中楼请查看原文。'}</p></main>
+  ${article.nextUrl ? `<button class="load-more" data-action="next">${question ? '加载更多回答' : '下一页回复'} →</button>` : ''}<p class="meta end-note">${question ? '回答按知乎默认顺序展示，仅展示当前登录可获取的内容。' : '仅展示当前登录可获取的内容。'}</p></main>
   <script nonce="${nonce}">${readerScript()}</script></body></html>`;
 }

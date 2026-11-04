@@ -9,6 +9,7 @@ dist/render.js
 dist/readerScript.js
 dist/comments.js
 dist/forums.js
+dist/tiebaComments.js
 .gitignore
 tsconfig.json
 *-sample.html

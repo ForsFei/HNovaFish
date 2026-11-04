@@ -1,13 +1,25 @@
 declare const acquireVsCodeApi: () => {
   getState(): { url?: string; scroll?: number } | undefined;
   setState(state: { url: string; scroll: number }): void;
-  postMessage(message: { action: string; url?: string; section?: number; comment?: string }): void;
+  postMessage(message: { action: string; url?: string; section?: number; comment?: string; focused?: boolean }): void;
 };
 
 // This function is serialized into the Webview. Keep all dependencies local or
 // browser globals so both TypeScript and DOM tests validate the shipped code.
 function initializeReader(): void {
   const vscode = acquireVsCodeApi();
+  // focusedView can still point at the tree/editor while the inner iframe has
+  // keyboard focus. Report real DOM focus so native, user-editable bindings work.
+  let reportedFocus: boolean | undefined;
+  const reportFocus = (focused: boolean) => {
+    if (reportedFocus === focused) return;
+    reportedFocus = focused;
+    vscode.postMessage({ action: 'readerFocus', focused });
+  };
+  window.addEventListener('focus', () => reportFocus(true));
+  window.addEventListener('blur', () => reportFocus(false));
+  document.addEventListener('pointerdown', () => reportFocus(true));
+  if (document.hasFocus()) reportFocus(true);
   const pageUrl = document.body.dataset.pageUrl || '';
   const nextLabel = document.body.dataset.nextLabel || '加载更多 →';
   const previous = vscode.getState();

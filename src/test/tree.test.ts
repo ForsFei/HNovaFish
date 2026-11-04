@@ -11,6 +11,7 @@ test('recommendation refresh replaces the batch, retains it on failure and resta
   let session = 'session=one';
   let fail = false;
   let calls = 0;
+  let revision = 0;
   let forums = ['图拉丁'];
   let forumInput = 'https://tieba.baidu.com/f?kw=%E7%94%B5%E5%BD%B1';
   let browseMode: 'temporary' | 'permanent' | undefined = 'temporary';
@@ -43,8 +44,10 @@ test('recommendation refresh replaces the batch, retains it on failure and resta
         const second = url.searchParams.get('pn') === '2';
         return new Response(JSON.stringify({ no: 0, data: { html: `<a href="/p/${second ? '102' : '101'}">${second ? '第二批首页推荐' : '第一批首页推荐'}</a>`, has_more: second ? 0 : 1 } }));
       }
-      return new Response('<a href="/p/432">其他贴吧帖子</a>');
+      assert.equal(url.searchParams.get('pn'), '0', 'Forum refresh always requests the first page');
+      return new Response(`<a href="/p/${432 + revision}">${revision ? '刷新后的帖子' : '其他贴吧帖子'}</a>`);
     }
+    if (url.pathname.includes('/hot-lists/')) return new Response(JSON.stringify({ data: [{ target: { id: 88 + revision, title: `热榜 ${revision}` } }] }));
     const second = new URL(String(input)).searchParams.get('page_number') === '2';
     return new Response(JSON.stringify({ data: second
       ? [{ target: { type: 'article', id: 3, title: '下一页文章' } }]
@@ -95,6 +98,23 @@ test('recommendation refresh replaces the batch, retains it on failure and resta
     assert.match(temporary.title, /临时浏览/); assert.equal(forums.includes('电影'), false);
     const posts = await tree.getChildren(temporary); assert.equal(posts[0].entry.title, '其他贴吧帖子');
     assert.ok(posts.some((node: any) => node.command === 'pinForum'));
+    const hot = updatedRoots.find((node: any) => node.source === 'zhihu');
+    const hotPosts = await tree.getChildren(hot);
+    assert.equal(tree.getTreeItem(hotPosts.at(-1)).label, '刷新热榜');
+    assert.equal(tree.getTreeItem(posts.at(-1)).label, '刷新帖子列表');
+    revision = 1;
+    await commands.get('hnovaFish.more')!(hot);
+    await commands.get('hnovaFish.more')!(temporary);
+    assert.equal((await tree.getChildren(hot))[0].entry.title, '热榜 1');
+    const refreshed = await tree.getChildren(temporary);
+    assert.equal(refreshed.filter((node: any) => node.kind === 'entry').length, 1);
+    assert.equal(refreshed[0].entry.title, '刷新后的帖子');
+    fail = true;
+    await commands.get('hnovaFish.more')!(temporary);
+    await commands.get('hnovaFish.more')!(hot);
+    assert.equal((await tree.getChildren(temporary))[0].entry.title, '刷新后的帖子');
+    assert.equal((await tree.getChildren(hot))[0].entry.title, '热榜 1');
+    fail = false;
     await commands.get('hnovaFish.pinForum')!('电影');
     updatedRoots = await tree.getChildren();
     assert.equal(updatedRoots.filter((node: any) => node.forum === '电影').length, 1); assert.ok(forums.includes('电影')); assert.ok(forums.includes('图拉丁'));

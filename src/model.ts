@@ -1,6 +1,6 @@
 export type Site = 'tieba' | 'zhihu';
 export interface Entry { id: string; site: Site; title: string; url: string; summary?: string; description?: string; }
-export interface Section { id?: string; author: string; html: string; votes?: number; url?: string; }
+export interface Section { id?: string; author: string; html: string; votes?: number; url?: string; tiebaReplyCount?: number; tiebaReplyPreview?: import('./comments').CommentItem[]; }
 export interface Article extends Entry {
   sections: Section[];
   nextUrl?: string;
@@ -9,6 +9,7 @@ export interface Article extends Entry {
   totalAnswers?: number;
   source?: 'api' | 'html';
   questionUrl?: string;
+  tiebaPreviewVersion?: number;
 }
 
 export function mergeSections(previous: Section[], incoming: Section[]): Section[] {

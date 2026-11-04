@@ -2,7 +2,7 @@
   "name": "hnova-fish",
   "displayName": "HNova Fish · 随手读",
   "description": "在 VS Code 中只读浏览贴吧、知乎，支持收藏、历史与专注阅读。",
-  "version": "0.1.14",
+  "version": "0.1.19",
   "publisher": "hnova",
   "engines": {
     "vscode": "^1.143.0"
@@ -25,6 +25,26 @@
   },
   "contributes": {
     "commands": [
+      {
+        "command": "hnovaFish.previousArticle",
+        "title": "上一篇帖子/文章",
+        "category": "HNova Fish"
+      },
+      {
+        "command": "hnovaFish.nextArticle",
+        "title": "下一篇帖子/文章",
+        "category": "HNova Fish"
+      },
+      {
+        "command": "hnovaFish.bossKey",
+        "title": "老板键：隐藏侧栏并返回编辑器",
+        "category": "HNova Fish"
+      },
+      {
+        "command": "hnovaFish.configureShortcuts",
+        "title": "设置阅读快捷键和老板键",
+        "category": "HNova Fish"
+      },
       {
         "command": "hnovaFish.refresh",
         "title": "刷新列表",
@@ -113,6 +133,11 @@
     "menus": {
       "view/title": [
         {
+          "command": "hnovaFish.configureShortcuts",
+          "when": "view == hnovaFish.feed || view == hnovaFish.reader",
+          "group": "settings"
+        },
+        {
           "command": "hnovaFish.refresh",
           "when": "view == hnovaFish.feed",
           "group": "navigation"
@@ -150,6 +175,20 @@
       ]
     },
     "keybindings": [
+      {
+        "command": "hnovaFish.previousArticle",
+        "key": "left",
+        "when": "(hnovaFish.readerFocused || focusedView == hnovaFish.reader || focusedView == hnovaFish.feed) && !inputFocus"
+      },
+      {
+        "command": "hnovaFish.nextArticle",
+        "key": "right",
+        "when": "(hnovaFish.readerFocused || focusedView == hnovaFish.reader || focusedView == hnovaFish.feed) && !inputFocus"
+      },
+      {
+        "command": "hnovaFish.bossKey",
+        "key": "numpad0"
+      },
       {
         "command": "hnovaFish.hide",
         "key": "ctrl+alt+;",

@@ -155,19 +155,39 @@ export function parseTiebaArticle(html: string, entry: Entry, pageUrl = entry.ur
   const sections: Article['sections'] = [];
   const readable = (content: ReturnType<typeof $>) => content.text().trim() || content.find('img').length;
   const metadata = (raw?: string) => { try { return raw ? platformJson.parse(raw) : {}; } catch { return {}; } };
+  const floorId = (node: ReturnType<typeof $>): string | undefined => {
+    const data = metadata(node.attr('data-field'));
+    const candidates = [data.content?.post_id, data.content?.pid, data.post_id, data.pid,
+      node.attr('data-pid'), node.attr('data-post-id'), node.find('.d_post_content').first().attr('id')];
+    for (const raw of candidates) {
+      const id = String(raw ?? '').match(/^(?:post_content_|post[_-])?([1-9]\d*)$/)?.[1];
+      if (id) return id;
+    }
+    for (const link of node.find('a[href*="pid="], a[href*="spid="]').toArray()) {
+      try { const pid = new URL($(link).attr('href')!, pageUrl).searchParams.get('pid'); if (pid && /^[1-9]\d*$/.test(pid)) return pid; } catch { /* Ignore broken links. */ }
+    }
+    // A mobile floor's DOM index (floor_1) is not a post ID. Prefer reply links.
+    return node.attr('id')?.match(/^(?:post_content_|post[_-])([1-9]\d*)$/)?.[1];
+  };
+  const replyCount = (node: ReturnType<typeof $>): number | undefined => {
+    const data = metadata(node.attr('data-field'));
+    const raw = data.content?.comment_num ?? data.content?.reply_num ?? data.comment_num ?? data.reply_num;
+    const count = raw === undefined ? undefined : Number(raw);
+    return Number.isSafeInteger(count) && count! >= 0 ? count : undefined;
+  };
   $('.l_post').each((_, el) => {
     const node = $(el), content = node.find('.d_post_content');
     const data = metadata(node.attr('data-field'));
-    if (content.length && readable(content)) sections.push({ id: data.content?.post_id ? String(data.content.post_id) : content.attr('id'), author: node.find('.p_author_name').first().text().trim() || data.author?.user_name || '吧友', html: content.html() || '' });
+    if (content.length && readable(content)) sections.push({ id: floorId(node), tiebaReplyCount: replyCount(node), author: node.find('.p_author_name').first().text().trim() || data.author?.user_name || '吧友', html: content.html() || '' });
   });
   // Some desktop responses omit the surrounding floor container.
   if (!sections.length) $('.d_post_content').each((_, el) => {
     const content = $(el);
-    if (readable(content)) sections.push({ id: content.attr('id'), author: '吧友', html: content.html() || '' });
+    if (readable(content)) sections.push({ id: floorId(content), tiebaReplyCount: replyCount(content), author: '吧友', html: content.html() || '' });
   });
   if (!sections.length) $('.floor, .post-item, .list_item, .p_postlist > li').each((_, el) => {
     const floor = $(el), content = floor.find('.content-text, .post-content, .content').first();
-    if (content.length && readable(content)) sections.push({ author: floor.find('.user_name, .username, .author, .p_author_name').first().text().trim() || '吧友', html: content.html() || '' });
+    if (content.length && readable(content)) sections.push({ id: floorId(floor), tiebaReplyCount: replyCount(floor), author: floor.find('.user_name, .username, .author, .p_author_name').first().text().trim() || '吧友', html: content.html() || '' });
   });
   // Legacy WAP floors are .i blocks with a user link and a floor marker.
   if (!sections.length) $('.i').each((_, el) => {
@@ -176,7 +196,7 @@ export function parseTiebaArticle(html: string, entry: Entry, pageUrl = entry.ur
     const author = floor.find('a[href*="un="], a[href*="/home"], .user_name').first();
     if (!author.length) return;
     const content = floor.clone(); content.find('script,style,form,.reply,.floor-info').remove();
-    sections.push({ author: author.text().trim() || '吧友', html: content.html() || '' });
+    sections.push({ id: floorId(floor), tiebaReplyCount: replyCount(floor), author: author.text().trim() || '吧友', html: content.html() || '' });
   });
   if (!sections.length) {
     const text = $('body').text();
