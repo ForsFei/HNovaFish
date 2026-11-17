@@ -5,6 +5,8 @@ import { renderArticle, renderEmptyReader } from './render';
 import { CommentView, commentTarget, loadComments, loadReplies } from './comments';
 import { forumName } from './forums';
 import { tiebaCommentTarget, loadTiebaComments, loadTiebaPreviews } from './tiebaComments';
+import { tiebaSessionFetch } from './tiebaSession';
+import { BrowserBridge, parseBrowserPairing } from './browserBridge';
 
 type Node = { kind: 'group'; title: string; source: 'tieba' | 'tiebaHome' | 'zhihu' | 'recommend' | 'saved' | 'history'; forum?: string }
   | { kind: 'entry'; entry: Entry; source?: string }
@@ -14,7 +16,48 @@ type Node = { kind: 'group'; title: string; source: 'tieba' | 'tiebaHome' | 'zhi
   | { kind: 'action'; title: string; command: string; forum?: string };
 
 export function activate(context: vscode.ExtensionContext): void {
-  const providers = new Providers(async site => context.secrets.get(`cookie.${site}`), (...args) => fetch(...args), () => vscode.workspace.getConfiguration('hnovaFish').get<string>('tiebaUserAgent'));
+  let browserBridge: BrowserBridge | undefined;
+  let bridgeStarting: Promise<BrowserBridge> | undefined;
+  let bridgeClosed = false;
+  const pairingKey = 'browser.tieba.pairing';
+  context.subscriptions.push({ dispose() { bridgeClosed = true; browserBridge?.dispose(); } });
+  async function ensureBrowserBridge(): Promise<BrowserBridge> {
+    if (bridgeStarting) return bridgeStarting;
+    bridgeStarting = (async () => {
+      if (vscode.env?.remoteName) throw new Error('浏览器协同需要在本机 VS Code 扩展宿主运行，请使用本地窗口。');
+      const saved = parseBrowserPairing(await context.secrets.get(pairingKey));
+      if (bridgeClosed) throw new Error('浏览器连接已关闭。');
+      const bridge = new BrowserBridge(saved, async pairing => { await context.secrets.store(pairingKey, JSON.stringify(pairing)); }, 8000);
+      try {
+        await bridge.start();
+        if (bridgeClosed) throw new Error('浏览器连接已关闭。');
+        browserBridge = bridge;
+        await context.secrets.store(pairingKey, JSON.stringify(bridge.pairing));
+        if (bridgeClosed) throw new Error('浏览器连接已关闭。');
+        return bridge;
+      } catch (error) {
+        bridge.dispose();
+        if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') throw new Error('浏览器连接端口已被占用，请关闭另一个启用随手读浏览器协同的 VS Code 窗口后重试。');
+        throw error;
+      }
+    })();
+    try { return await bridgeStarting; }
+    catch (error) { bridgeStarting = undefined; browserBridge = undefined; throw error; }
+  }
+  const browserMode = () => vscode.workspace.getConfiguration('hnovaFish').get<string>('tiebaAccessMode', 'direct') === 'browser';
+  if (browserMode() && !vscode.env?.remoteName) void ensureBrowserBridge().catch(error => {
+    if (!bridgeClosed) void vscode.window.showWarningMessage(errorMessage(error));
+  });
+  const cookieFor = async (site: Site) => site === 'tieba' && browserMode() ? undefined : context.secrets.get(`cookie.${site}`);
+  const directSessionFetch = tiebaSessionFetch(context.secrets, (...args) => fetch(...args));
+  const sessionFetch: typeof fetch = (input, init) => {
+    const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    if (url.hostname === 'tieba.baidu.com' && browserMode()) {
+      return ensureBrowserBridge().then(bridge => bridge.fetch(input, init));
+    }
+    return directSessionFetch(input, init);
+  };
+  const providers = new Providers(cookieFor, sessionFetch, () => vscode.workspace.getConfiguration('hnovaFish').get<string>('tiebaUserAgent'));
   const changes = new vscode.EventEmitter<void>();
   context.subscriptions.push(changes);
   const entries = (key: string) => context.globalState.get<Entry[]>(key, []);
@@ -76,9 +119,10 @@ export function activate(context: vscode.ExtensionContext): void {
         const ticket = listGeneration;
         if (!lists.has(key)) {
           if (node.source === 'recommend' || node.source === 'tiebaHome') {
-            const page = await (node.source === 'recommend' ? providers.recommendations() : providers.tiebaHome());
+            const page = await (providers.recommendationBatch(node.source));
             if (ticket !== listGeneration) return [];
             lists.set(key, page.entries);
+        if (navigation?.key === key) { navigation.items = [...page.entries]; draw(); }
             if (page.nextUrl) recommendationNext.set(key, page.nextUrl);
           } else {
             const result = await providers.list(node.source, node.forum);
@@ -101,6 +145,9 @@ export function activate(context: vscode.ExtensionContext): void {
   };
   context.subscriptions.push(vscode.window.registerTreeDataProvider('hnovaFish.feed', tree));
   let reader: vscode.WebviewView | undefined;
+  const readerViews = new Map<string, vscode.WebviewView>();
+  const readerId = () => config().get<string>('readerPosition', 'right') === 'bottom' ? 'hnovaFish.readerBottom' : 'hnovaFish.reader';
+  const closeReader = () => vscode.commands.executeCommand(readerId() === 'hnovaFish.readerBottom' ? 'workbench.action.closePanel' : 'workbench.action.closeAuxiliaryBar');
   let current: Article | undefined;
   let cached = false;
   let generation = 0;
@@ -109,10 +156,14 @@ export function activate(context: vscode.ExtensionContext): void {
   let fontChange: Promise<void> = Promise.resolve();
   let disposed = false;
   context.subscriptions.push({ dispose() { disposed = true; generation++; } });
+  const workspaceProblems = () => (vscode.languages?.getDiagnostics?.() || []).flatMap(([uri, items]) => items.map(item => ({
+    file: uri.path.split('/').pop() || uri.path, line: item.range.start.line + 1,
+    severity: ['错误', '警告', '信息', '提示'][item.severity] || '信息', message: item.message
+  }))).slice(0, 80);
   const draw = () => {
     if (!reader) return;
     reader.title = current?.title || '阅读';
-    reader.webview.html = current ? renderArticle(current, { images: config().get('showImages', false), fontSize: config().get('fontSize', 15), saved: entries('saved').some(e => e.id === current!.id), cached, comments: commentViews }) : renderEmptyReader();
+    reader.webview.html = current ? renderArticle(current, { images: config().get('showImages', false), fontSize: config().get('fontSize', 15), saved: entries('saved').some(e => e.id === current!.id), cached, comments: commentViews, bottom: readerId() === 'hnovaFish.readerBottom', problems: workspaceProblems(), widths: context.globalState.get('readerWidths'), directory: navigation?.items || [current, ...entries('history').filter(e => e.id !== current!.id)] }) : renderEmptyReader();
   };
   async function cache(article: Article) {
     // Keep a bounded local cache. Cookies are never stored here.
@@ -129,11 +180,11 @@ export function activate(context: vscode.ExtensionContext): void {
   async function show(article: Article, fromCache: boolean) {
     if (current?.id !== article.id) commentViews = {};
     current = article; cached = fromCache;
-    if (!reader) await vscode.commands.executeCommand('hnovaFish.reader.focus');
+    if (!reader) await vscode.commands.executeCommand(`${readerId()}.focus`);
     else reader.show(false);
     draw();
   }
-  context.subscriptions.push(vscode.window.registerWebviewViewProvider('hnovaFish.reader', {
+  const readerProvider: vscode.WebviewViewProvider = {
     resolveWebviewView(view) {
       reader = view;
       view.webview.options = { enableScripts: true, localResourceRoots: [] };
@@ -147,6 +198,32 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!current) return;
         const { action, url, section, comment } = message as { action?: string; url?: string; section?: number; comment?: string };
         try {
+          if (action === 'resizeColumns') {
+            const { directoryWidth, workWidth } = message as { directoryWidth?: number; workWidth?: number };
+            if (typeof directoryWidth === 'number' && Number.isFinite(directoryWidth) && typeof workWidth === 'number' && Number.isFinite(workWidth)) {
+              await context.globalState.update('readerWidths', { directory: Math.max(120, Math.min(480, directoryWidth)), work: Math.max(180, Math.min(600, workWidth)) });
+            }
+            return;
+          }
+          if (action === 'refreshDirectory') {
+            try {
+              const key = navigation?.key;
+              const source = key?.split(':')[0];
+              if (source === 'recommend' || source === 'tiebaHome' || source === 'zhihu' || source === 'tieba') {
+                await refreshGroup({ kind: 'group', title: '', source, forum: source === 'tieba' ? key!.slice(key!.indexOf(':') + 1) : undefined });
+              } else {
+                if (navigation && (source === 'saved' || source === 'history')) navigation.items = entries(source);
+                draw();
+              }
+            } finally { void reader?.webview.postMessage({ type: 'directoryRefreshDone' }); }
+            return;
+          }
+          if (action === 'selectPost' && typeof url === 'string') {
+            const allowed = navigation?.items || [current, ...entries('history')];
+            const entry = allowed.find(item => item.url === url);
+            if (entry && entry.id !== current.id) await read(entry, false, undefined, navigation?.key);
+            return;
+          }
           if (action === 'fontDown' || action === 'fontUp' || action === 'fontReset') {
             fontChange = fontChange.catch(() => {}).then(async () => {
               const settings = config();
@@ -160,7 +237,7 @@ export function activate(context: vscode.ExtensionContext): void {
           if ((action === 'replies' || action === 'repliesMore') && typeof section === 'number' && typeof comment === 'string') { await readReplies(section, comment, action === 'repliesMore'); return; }
           if ((action === 'comments' || action === 'commentsMore') && typeof section === 'number') { await readComments(section, action === 'commentsMore'); return; }
           if (action === 'recoverReplies' && typeof section === 'number') { await recoverReplies(section); return; }
-          if (action === 'hide') { await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar'); return; }
+          if (action === 'hide') { await closeReader(); return; }
           if (action === 'original') { await external(current.url); return; }
           if (action === 'link' && typeof url === 'string') { await external(url); return; }
           if (action === 'save') {
@@ -179,7 +256,16 @@ export function activate(context: vscode.ExtensionContext): void {
       }, null, context.subscriptions);
       draw();
     }
-  }, { webviewOptions: { retainContextWhenHidden: true } }));
+  };
+  for (const id of ['hnovaFish.reader', 'hnovaFish.readerBottom']) {
+    context.subscriptions.push(vscode.window.registerWebviewViewProvider(id, {
+      resolveWebviewView(view, context, token) {
+        readerViews.set(id, view);
+        view.onDidDispose(() => { if (readerViews.get(id) === view) readerViews.delete(id); });
+        return readerProvider.resolveWebviewView(view, context, token);
+      }
+    }, { webviewOptions: { retainContextWhenHidden: true } }));
+  }
   async function recoverReplies(index: number) {
     const article = current, floor = article?.sections[index];
     if (!article || article.site !== 'tieba' || !floor) return;
@@ -202,7 +288,7 @@ export function activate(context: vscode.ExtensionContext): void {
     commentViews[key] = { ...(previous || initial), loading: true, error: undefined }; draw();
     try {
       const page = tiebaTarget
-        ? await loadTiebaComments(tiebaTarget, await context.secrets.get('cookie.tieba'), more ? previous?.nextUrl : undefined, (...args) => fetch(...args), config().get<string>('tiebaUserAgent'))
+        ? await loadTiebaComments(tiebaTarget, await cookieFor('tieba'), more ? previous?.nextUrl : undefined, sessionFetch, config().get<string>('tiebaUserAgent'))
         : await loadComments(target!, await context.secrets.get('cookie.zhihu'), more ? previous?.nextUrl : undefined);
       if (ticket !== generation || current !== article) return;
       const items = more ? [...new Map([...(previous?.items || []), ...page.items].map(item => [item.id, item])).values()] : page.items;
@@ -255,13 +341,13 @@ export function activate(context: vscode.ExtensionContext): void {
     };
     const stored = context.globalState.get<Article[]>('articles', []).find(a => a.id === entry.id);
     const legacyQuestionCache = entry.site === 'zhihu' && /^\/question\/\d+\/?$/.test(new URL(entry.url).pathname) && !stored?.kind;
-    const legacyTiebaCache = entry.site === 'tieba' && stored && stored.tiebaPreviewVersion !== 2;
+    const legacyTiebaCache = entry.site === 'tieba' && stored && stored.tiebaPreviewVersion !== 3;
     if (stored && !fresh && !legacyQuestionCache && !legacyTiebaCache) { selectNavigation(); await show(stored, true); await record(stored); return; }
     if (nextUrl) loadingNext = true;
     try {
       const article = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: '随手读：正在加载正文…' }, async () => {
         const result = await providers.article(entry, nextUrl);
-        if (result.site === 'tieba') await loadTiebaPreviews(result, await context.secrets.get('cookie.tieba'), nextUrl, (...args) => fetch(...args), config().get<string>('tiebaUserAgent'));
+        if (result.site === 'tieba') result.tiebaPreviewVersion = 3;
         return result;
       });
       if (disposed || ticket !== generation) return;
@@ -271,6 +357,13 @@ export function activate(context: vscode.ExtensionContext): void {
         article.totalAnswers ??= previous.totalAnswers;
       }
       selectNavigation(); await show(article, false); await cache(article); await record(article);
+      // Reply previews are optional enrichment: never hold back the readable body.
+      if (article.site === 'tieba') void (async () => {
+        const enriched = await loadTiebaPreviews(article, await cookieFor('tieba'), nextUrl, sessionFetch, config().get<string>('tiebaUserAgent'));
+        if (!enriched) return;
+        if (disposed || ticket !== generation || current !== article) return;
+        draw(); await cache(article);
+      })().catch(() => { /* Keep the body readable if enrichment fails. */ });
     } catch (error) {
       if (disposed || ticket !== generation) return;
       if (stored && !nextUrl) { selectNavigation(); await show(stored, true); await record(stored); }
@@ -285,6 +378,25 @@ export function activate(context: vscode.ExtensionContext): void {
     try { await handler(...args); } catch (error) { void vscode.window.showErrorMessage(errorMessage(error)); }
   }));
   command('read', read);
+  command('connectBrowser', async () => {
+    const bridge = await ensureBrowserBridge();
+    const { port, token } = bridge.pairing;
+    const address = `http://127.0.0.1:${port}/#${token}`;
+    await config().update('tiebaAccessMode', 'browser', vscode.ConfigurationTarget.Global);
+    await vscode.env.clipboard.writeText(address);
+    resetLists();
+    const choice = await vscode.window.showInformationMessage('浏览器连接地址已复制。请在 Edge 配套扩展的连接页面粘贴并连接，保持该页面打开。配对一次后，VS Code 重载会自动恢复连接。首次安装可打开配套扩展文件夹。', '打开配套扩展文件夹');
+    if (choice) await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.joinPath(context.extensionUri, 'browser-companion', 'manifest.json'));
+  });
+  command('browserFolder', () => vscode.commands.executeCommand('revealFileInOS', vscode.Uri.joinPath(context.extensionUri, 'browser-companion', 'manifest.json')));
+  command('disconnectBrowser', async () => {
+    await bridgeStarting?.catch(() => {});
+    browserBridge?.dispose(); browserBridge = undefined; bridgeStarting = undefined;
+    await context.secrets.delete(pairingKey);
+    await config().update('tiebaAccessMode', 'direct', vscode.ConfigurationTarget.Global);
+    resetLists();
+    void vscode.window.showInformationMessage('已断开浏览器协同，贴吧恢复直接请求模式。');
+  });
   async function navigate(direction: number) {
     if (navigating || !navigation || !current) return;
     const items = lists.get(navigation.key) || navigation.items;
@@ -307,9 +419,7 @@ export function activate(context: vscode.ExtensionContext): void {
       for (const replies of Object.values(view.replies || {})) replies.loading = false;
     }
     draw();
-    await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
-    await vscode.commands.executeCommand('workbench.action.closeSidebar');
-    await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+    await vscode.commands.executeCommand('workbench.panel.output.focus');
   });
   command('configureShortcuts', () => vscode.commands.executeCommand('workbench.action.openGlobalKeybindings', '@ext:hnova.hnova-fish'));
   command('external', external);
@@ -319,18 +429,19 @@ export function activate(context: vscode.ExtensionContext): void {
     if (choice === '设置 Cookie') await vscode.commands.executeCommand('hnovaFish.cookie', new URL(url).hostname === 'tieba.baidu.com' ? 'tieba' : 'zhihu');
   });
   command('refresh', resetLists);
-  command('hide', () => vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar'));
-  command('focusReader', () => vscode.commands.executeCommand('hnovaFish.reader.focus'));
+  command('hide', closeReader);
+  command('focusReader', () => vscode.commands.executeCommand(`${readerId()}.focus`));
   command('reloadReader', async () => { if (current) await read(current, true); });
-  command('more', async (group: Extract<Node, {kind: 'group'}>) => {
+  async function refreshGroup(group: Extract<Node, {kind: 'group'}>) {
     if (group.source === 'recommend' || group.source === 'tiebaHome') {
       const key = groupKey(group), next = recommendationNext.get(key), ticket = listGeneration;
       if (loadingLists.has(key)) return;
       loadingLists.add(key);
       try {
-        const page = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: '随手读：刷新推荐…' }, () => group.source === 'recommend' ? providers.recommendations(next) : providers.tiebaHome(next));
+        const page = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: '随手读：刷新推荐…' }, () => providers.recommendationBatch(group.source as 'recommend' | 'tiebaHome', next));
         if (ticket !== listGeneration) return;
         lists.set(key, page.entries);
+        if (navigation?.key === key) { navigation.items = [...page.entries]; draw(); }
         if (page.nextUrl) recommendationNext.set(key, page.nextUrl);
         else recommendationNext.delete(key);
         changes.fire();
@@ -344,9 +455,12 @@ export function activate(context: vscode.ExtensionContext): void {
     try {
       const result = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: group.source === 'zhihu' ? '随手读：刷新热榜…' : '随手读：刷新帖子列表…' }, () => providers.list(group.source as 'tieba' | 'zhihu', group.forum));
       if (ticket !== listGeneration) return;
-      lists.set(key, result); changes.fire();
+      lists.set(key, result);
+      if (navigation?.key === key) { navigation.items = [...result]; draw(); }
+      changes.fire();
     } finally { loadingLists.delete(key); }
-  });
+  }
+  command('more', refreshGroup);
   command('openUrl', async () => {
     const url = await vscode.window.showInputBox({ title: '阅读帖子链接', prompt: '贴吧帖子 / 知乎问题、回答、专栏文章', placeHolder: 'https://tieba.baidu.com/p/…', ignoreFocusOut: true,
       validateInput: value => { try { parseLink(value); return undefined; } catch (error) { return errorMessage(error); } } });
@@ -390,6 +504,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (value === undefined) return;
       await context.secrets.store(`cookie.${site}`, value.trim());
     } else return;
+    if (site === 'tieba') { directSessionFetch.reset(); await context.secrets.delete('cookie.tieba.session'); }
     resetLists(); void vscode.window.showInformationMessage('本机登录状态已更新。');
   });
   command('clearHistory', async () => {
@@ -397,7 +512,12 @@ export function activate(context: vscode.ExtensionContext): void {
     void vscode.window.showInformationMessage('阅读历史和正文缓存已清空，收藏保留。');
   });
   context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
-    if (e.affectsConfiguration('hnovaFish.forums') || e.affectsConfiguration('hnovaFish.tiebaUserAgent')) resetLists();
+    if (e.affectsConfiguration('hnovaFish.forums') || e.affectsConfiguration('hnovaFish.tiebaUserAgent') || e.affectsConfiguration('hnovaFish.tiebaAccessMode')) resetLists();
+    if (e.affectsConfiguration('hnovaFish.readerPosition')) {
+      reader = readerViews.get(readerId());
+      void vscode.commands.executeCommand('setContext', 'hnovaFish.readerFocused', false);
+      if (current) void vscode.commands.executeCommand(`${readerId()}.focus`);
+    }
     if (e.affectsConfiguration('hnovaFish')) draw();
   }));
 }

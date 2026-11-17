@@ -2,7 +2,7 @@
   "name": "hnova-fish",
   "displayName": "HNova Fish · 随手读",
   "description": "在 VS Code 中只读浏览贴吧、知乎，支持收藏、历史与专注阅读。",
-  "version": "0.1.19",
+  "version": "0.1.35",
   "publisher": "hnova",
   "engines": {
     "vscode": "^1.143.0"
@@ -13,6 +13,7 @@
   "license": "MIT",
   "main": "./dist/extension.js",
   "activationEvents": [
+    "onStartupFinished",
     "onView:hnovaFish.feed",
     "onView:hnovaFish.reader"
   ],
@@ -25,6 +26,22 @@
   },
   "contributes": {
     "commands": [
+      {
+        "command": "hnovaFish.connectBrowser",
+        "title": "连接贴吧浏览器",
+        "category": "HNova Fish",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "hnovaFish.browserFolder",
+        "title": "打开浏览器配套扩展文件夹",
+        "category": "HNova Fish"
+      },
+      {
+        "command": "hnovaFish.disconnectBrowser",
+        "title": "断开浏览器并使用直接请求",
+        "category": "HNova Fish"
+      },
       {
         "command": "hnovaFish.previousArticle",
         "title": "上一篇帖子/文章",
@@ -82,7 +99,7 @@
       },
       {
         "command": "hnovaFish.focusReader",
-        "title": "打开右侧阅读栏",
+        "title": "打开阅读窗口",
         "category": "HNova Fish",
         "icon": "$(open-preview)"
       },
@@ -113,6 +130,13 @@
           "title": "随手读 · 阅读",
           "icon": "media/fish.svg"
         }
+      ],
+      "panel": [
+        {
+          "id": "hnovaFishReadingPanel",
+          "title": "随手读 · 阅读",
+          "icon": "media/fish.svg"
+        }
       ]
     },
     "views": {
@@ -126,15 +150,29 @@
         {
           "id": "hnovaFish.reader",
           "name": "阅读",
-          "type": "webview"
+          "type": "webview",
+          "when": "config.hnovaFish.readerPosition != bottom"
+        }
+      ],
+      "hnovaFishReadingPanel": [
+        {
+          "id": "hnovaFish.readerBottom",
+          "name": "阅读",
+          "type": "webview",
+          "when": "config.hnovaFish.readerPosition == bottom"
         }
       ]
     },
     "menus": {
       "view/title": [
         {
+          "command": "hnovaFish.connectBrowser",
+          "when": "view == hnovaFish.feed",
+          "group": "navigation"
+        },
+        {
           "command": "hnovaFish.configureShortcuts",
-          "when": "view == hnovaFish.feed || view == hnovaFish.reader",
+          "when": "view == hnovaFish.feed || (view == hnovaFish.reader || view == hnovaFish.readerBottom)",
           "group": "settings"
         },
         {
@@ -159,12 +197,12 @@
         },
         {
           "command": "hnovaFish.reloadReader",
-          "when": "view == hnovaFish.reader",
+          "when": "(view == hnovaFish.reader || view == hnovaFish.readerBottom)",
           "group": "navigation"
         },
         {
           "command": "hnovaFish.hide",
-          "when": "view == hnovaFish.reader",
+          "when": "(view == hnovaFish.reader || view == hnovaFish.readerBottom)",
           "group": "navigation"
         },
         {
@@ -178,12 +216,12 @@
       {
         "command": "hnovaFish.previousArticle",
         "key": "left",
-        "when": "(hnovaFish.readerFocused || focusedView == hnovaFish.reader || focusedView == hnovaFish.feed) && !inputFocus"
+        "when": "(hnovaFish.readerFocused || focusedView == hnovaFish.reader || focusedView == hnovaFish.readerBottom || focusedView == hnovaFish.feed) && !inputFocus"
       },
       {
         "command": "hnovaFish.nextArticle",
         "key": "right",
-        "when": "(hnovaFish.readerFocused || focusedView == hnovaFish.reader || focusedView == hnovaFish.feed) && !inputFocus"
+        "when": "(hnovaFish.readerFocused || focusedView == hnovaFish.reader || focusedView == hnovaFish.readerBottom || focusedView == hnovaFish.feed) && !inputFocus"
       },
       {
         "command": "hnovaFish.bossKey",
@@ -198,6 +236,19 @@
     "configuration": {
       "title": "HNova Fish",
       "properties": {
+        "hnovaFish.tiebaAccessMode": {
+          "type": "string",
+          "enum": [
+            "direct",
+            "browser"
+          ],
+          "default": "direct",
+          "enumDescriptions": [
+            "通过插件直接请求贴吧",
+            "通过本机 Edge 配套扩展读取贴吧"
+          ],
+          "description": "贴吧访问方式。浏览器模式需要运行连接命令并保持配套扩展连接页打开。"
+        },
         "hnovaFish.forums": {
           "type": "array",
           "items": {
@@ -225,6 +276,19 @@
           "default": "",
           "pattern": "^[^\\r\\n]*$",
           "description": "可选：复制登录贴吧的同一浏览器请求标头中的 User-Agent（仅填值）。空值使用默认请求标头；不会自动解决百度设备验证。"
+        },
+        "hnovaFish.readerPosition": {
+          "type": "string",
+          "enum": [
+            "right",
+            "bottom"
+          ],
+          "enumDescriptions": [
+            "右侧阅读栏",
+            "下方阅读面板"
+          ],
+          "default": "right",
+          "description": "阅读位置，修改后立即切换并保留当前文章。"
         }
       }
     }
@@ -241,7 +305,8 @@
   },
   "dependencies": {
     "cheerio": "^1.1.2",
-    "json-bigint": "^1.0.0"
+    "json-bigint": "^1.0.0",
+    "tough-cookie": "^6.1.0"
   },
   "repository": {
     "type": "git",

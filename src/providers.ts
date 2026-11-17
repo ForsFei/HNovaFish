@@ -5,7 +5,7 @@ import { Article, Entry, Site, assertSiteUrl, parseLink } from './model';
 export const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 export class PlatformError extends Error {}
 const platformJson = JSONbig({ storeAsString: true });
-export const ZHIHU_RECOMMEND_URL = 'https://www.zhihu.com/api/v3/feed/topstory/recommend?desktop=true&limit=20&action=down&after_id=0&page_number=1';
+export const ZHIHU_RECOMMEND_URL = 'https://www.zhihu.com/api/v3/feed/topstory/recommend?desktop=true&limit=30&action=down&after_id=0&page_number=1';
 export interface RecommendationPage { entries: Entry[]; nextUrl?: string; }
 
 export const TIEBA_HOME_FEED = 'https://tieba.baidu.com/f/index/feedlist';
@@ -91,7 +91,7 @@ export function parseRecommendations(body: string, currentUrl = ZHIHU_RECOMMEND_
 export async function request(url: string, site: Site, cookie?: string, fetcher: typeof fetch = fetch, userAgent?: string): Promise<string> {
   assertSiteUrl(url, site);
   const response = await fetcher(url, {
-    redirect: 'manual', signal: AbortSignal.timeout(18000),
+    redirect: 'manual', signal: AbortSignal.timeout(site === 'tieba' ? 45000 : 18000),
     headers: { 'User-Agent': userAgent?.trim() || USER_AGENT, 'Accept': 'application/json,text/html;q=0.9',
       ...(site === 'tieba' ? { 'Referer': 'https://tieba.baidu.com/', 'Accept-Language': 'zh-CN,zh;q=0.9' } : {}), ...(cookie ? { Cookie: cookie } : {}) }
   });
@@ -116,11 +116,25 @@ export function parseTiebaList(html: string): Entry[] {
   // Desktop Tieba sometimes wraps its thread list in HTML comments.
   const $ = cheerio.load(html.replace(/<!--([\s\S]*?)-->/g, (_, content: string) => content.includes('threadlist') ? content : ''));
   const found = new Map<string, Entry>();
+  const cards = $('.thread-card');
+  if (cards.length) {
+    cards.each((_, element) => {
+      const card = $(element), title = card.find('.thread-title').first().text().trim();
+      const href = card.find('a.thread-content-link').first().attr('href');
+      if (!title || !href) return;
+      try {
+        const entry = parseLink(new URL(href, 'https://tieba.baidu.com').href);
+        if (entry.site === 'tieba') found.set(entry.url, { ...entry, title, summary: card.find('.thread-content').first().text().trim() });
+      } catch { /* Ignore ads and unsupported links. */ }
+    });
+    return [...found.values()];
+  }
   $('a[href]').each((_, el) => {
     const a = $(el), href = a.attr('href') || '';
+    if (a.closest('.thread-action-area, .comment-link-zone').length) return;
     const match = href.match(/(?:\/p\/|[?&]kz=)(\d+)/);
     const title = (a.attr('title') || a.text()).trim();
-    if (!match || title.length < 3 || /^(回复|点击|查看|\d+条)/.test(title)) return;
+    if (!match || title.length < 3 || /^(回复|点击|查看|\d+条)/.test(title) || !a.attr('title') && /^\d+$/.test(title)) return;
     const url = `https://tieba.baidu.com/p/${match[1]}`;
     if (!found.has(url)) found.set(url, { ...parseLink(url), title });
   });
@@ -175,7 +189,22 @@ export function parseTiebaArticle(html: string, entry: Entry, pageUrl = entry.ur
     const count = raw === undefined ? undefined : Number(raw);
     return Number.isSafeInteger(count) && count! >= 0 ? count : undefined;
   };
-  $('.l_post').each((_, el) => {
+  const modernBody = $('.pb-content-wrap').first();
+  if (modernBody.length && readable(modernBody)) sections.push({ author: $('.center-content .head-name').first().text().trim() || '楼主', html: modernBody.html() || '' });
+  $('.pb-comment-item').each((_, element) => {
+    const floor = $(element), content = floor.children('.comment-content').first().clone();
+    content.find('.pc-pb-comments-desc, .lzl-wrapper, script, style').remove();
+    if (!content.length || !readable(content)) return;
+    const id = floor.attr('data-id');
+    const replies = floor.find('.pb-lzl-item').toArray().map((reply, index) => {
+      const node = $(reply), body = node.children('.comment-content').first().clone();
+      body.find('.pc-pb-comments-desc, script, style').remove();
+      return { id: node.attr('data-id') || `preview-${id}-${index}`, author: node.find('.head-name').first().text().trim() || '吧友', html: body.html() || '', children: [], moreReplies: 0 };
+    }).filter(reply => reply.html.trim());
+    const more = Number(floor.find('.show-more-lzl').text().match(/展开\s*(\d+)\s*条/)?.[1] || 0);
+    sections.push({ id: id && /^\d+$/.test(id) ? id : undefined, author: floor.find('.head-name').first().text().trim() || '吧友', html: content.html() || '', tiebaReplyCount: replies.length + more, tiebaReplyPreview: replies.slice(0, 3) });
+  });
+  if (!sections.length) $('.l_post').each((_, el) => {
     const node = $(el), content = node.find('.d_post_content');
     const data = metadata(node.attr('data-field'));
     if (content.length && readable(content)) sections.push({ id: floorId(node), tiebaReplyCount: replyCount(node), author: node.find('.p_author_name').first().text().trim() || data.author?.user_name || '吧友', html: content.html() || '' });
@@ -211,7 +240,7 @@ export function parseTiebaArticle(html: string, entry: Entry, pageUrl = entry.ur
       if (normalized && Number(new URL(normalized).searchParams.get('pn')) > Number(new URL(pageUrl).searchParams.get('pn') || 0)) nextUrl = normalized;
     } catch { /* A broken next link must not discard readable floors. */ }
   }
-  return { ...entry, title: $('h3.core_title_txt, h1, .thread_title, .ti_title').first().text().trim() || $('title').text().replace(/_.*$/, '').trim() || entry.title, sections, nextUrl, fetchedAt: Date.now() };
+  return { ...entry, title: $('.pb-title, h3.core_title_txt, h1, .thread_title, .ti_title').first().text().trim() || $('title').text().replace(/_.*$/, '').trim() || entry.title, sections, nextUrl, fetchedAt: Date.now() };
 }
 
 export function parseZhihuArticle(html: string, entry: Entry): Article {
@@ -240,6 +269,24 @@ export function parseZhihuArticle(html: string, entry: Entry): Article {
 
 export class Providers {
   constructor(private readonly cookie: (site: Site) => Promise<string | undefined>, private readonly fetcher: typeof fetch = (...args) => fetch(...args), private readonly tiebaUserAgent: () => string | undefined = () => undefined) {}
+  async recommendationBatch(source: 'recommend' | 'tiebaHome', pageUrl?: string): Promise<RecommendationPage> {
+    const found = new Map<string, Entry>();
+    const visited = new Set<string>();
+    let nextUrl = pageUrl;
+    // Bound work even when the server returns duplicate cards or cyclic cursors.
+    for (let page = 0; page < 4 && found.size < 30; page++) {
+      const cursor = nextUrl || 'first';
+      if (visited.has(cursor)) { nextUrl = undefined; break; }
+      visited.add(cursor);
+      let result: RecommendationPage;
+      try { result = await (source === 'recommend' ? this.recommendations(nextUrl) : this.tiebaHome(nextUrl)); }
+      catch (error) { if (!found.size) throw error; break; }
+      for (const entry of result.entries) if (!found.has(entry.id) && found.size < 30) found.set(entry.id, entry);
+      nextUrl = result.nextUrl;
+      if (!nextUrl) break;
+    }
+    return { entries: [...found.values()], nextUrl };
+  }
   async tiebaHome(pageUrl?: string): Promise<RecommendationPage> {
     const page = tiebaHomePage(pageUrl), cookie = await this.cookie('tieba');
     const lastTid = pageUrl ? new URL(pageUrl).searchParams.get('last_tid') || undefined : undefined;

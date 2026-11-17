@@ -10,6 +10,8 @@ dist/readerScript.js
 dist/comments.js
 dist/forums.js
 dist/tiebaComments.js
+dist/tiebaSession.js
+dist/browserBridge.js
 .gitignore
 tsconfig.json
 *-sample.html

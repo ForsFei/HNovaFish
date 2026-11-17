@@ -110,3 +110,13 @@ test('Tieba reply pagination rejects cross-thread, cross-floor, unsafe hosts and
   }) as typeof fetch, 'Browser/145');
   assert.equal(page.items.length, 1);
 });
+
+
+test('modern pages reuse embedded reply previews without an extra browser API request', async () => {
+  const article = parseTiebaArticle('<div class="pb-content-wrap">主楼</div><div class="pb-comment-item" data-id="123"><div class="comment-content">楼层正文<div class="lzl-wrapper"><div class="pb-lzl-item"><a class="head-name">甲</a><div class="comment-content">已有回复</div></div><div class="show-more-lzl">展开 2 条回复</div></div></div></div>', parseLink('https://tieba.baidu.com/p/123'));
+  await loadTiebaPreviews(article, undefined, undefined, (async () => assert.fail('Embedded previews need no extra request')) as typeof fetch);
+  assert.equal(article.sections[1].tiebaReplyCount, 3);
+  assert.equal(article.sections[1].tiebaReplyPreview?.[0].author, '甲');
+  assert.match(article.sections[1].tiebaReplyPreview![0].html, /已有回复/);
+  assert.match(renderArticle(article, { images: false, fontSize: 15, saved: false }), /展开剩余 2 条回复/);
+});

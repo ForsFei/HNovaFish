@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "HNova Fish 浏览器协同",
+  "version": "0.1.4",
+  "description": "使用当前浏览器的贴吧页面读取帖子，连接本机 VS Code 随手读。",
+  "permissions": [
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://tieba.baidu.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "action": {
+    "default_title": "打开随手读连接页"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "connect.html"
+}

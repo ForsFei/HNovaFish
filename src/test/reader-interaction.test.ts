@@ -6,6 +6,76 @@ import { Article, parseLink } from '../model';
 import { renderArticle } from '../render';
 
 const answer: Article = { ...parseLink('https://www.zhihu.com/question/12/answer/99'), title: '问题', sections: [{ author: '作者', html: '<p>回答正文</p><a href="https://www.zhihu.com/question/34">链接</a>' }], fetchedAt: 1 };
+
+test('selecting another post retains the directory scroll but resets body scroll; a new list resets the directory', () => {
+  const other = { ...answer, ...parseLink('https://tieba.baidu.com/p/123'), title: '另一个帖子' };
+  let state: any;
+  const open = (article: Article, directory: Article[]) => {
+    const dom = new JSDOM(renderArticle(article, { images: false, fontSize: 15, saved: false, bottom: true, directory }), { runScripts: 'outside-only' });
+    dom.window.scrollTo = ((options: ScrollToOptions) => { Object.defineProperty(dom.window, 'scrollY', { value: options.top, configurable: true }); }) as typeof dom.window.scrollTo;
+    dom.window.requestAnimationFrame = callback => { callback(0); return 0; };
+    (dom.window as any).acquireVsCodeApi = () => ({ getState: () => state, setState: (value: any) => { state = value; }, postMessage() {} });
+    dom.window.eval(dom.window.document.querySelector('script')!.textContent!);
+    return dom;
+  };
+  const first = open(answer, [answer, other]);
+  const list = first.window.document.querySelector<HTMLElement>('.post-directory')!;
+  list.scrollTop = 580; list.dispatchEvent(new first.window.Event('scroll'));
+  Object.defineProperty(first.window, 'scrollY', { value: 1000, configurable: true });
+  first.window.document.querySelectorAll<HTMLButtonElement>('.post-directory button[data-action=selectPost]')[1].click();
+  assert.equal(state.directoryScroll, 580);
+  first.window.close();
+  const second = open(other, [answer, other]);
+  assert.equal(second.window.document.querySelector<HTMLElement>('.post-directory')!.scrollTop, 580);
+  assert.equal(second.window.scrollY, 0);
+  second.window.close();
+  const third = open(other, [other]);
+  assert.equal(third.window.document.querySelector<HTMLElement>('.post-directory')!.scrollTop, 0);
+  third.window.close();
+});
+
+test('bottom reader has a separate post directory, aligned toolbar and clickable safe entries', () => {
+  const other = { ...parseLink('https://tieba.baidu.com/p/123'), title: '<script>标题</script>' };
+  const messages: any[] = [];
+  const dom = new JSDOM(renderArticle(answer, { images: false, fontSize: 15, saved: false, bottom: true, directory: [answer, other], problems: [{ file: 'app.ts', line: 9, severity: '错误', message: '<script>诊断内容</script>' }] }), { runScripts: 'outside-only' });
+  try {
+    dom.window.scrollTo = () => {};
+    dom.window.requestAnimationFrame = callback => { callback(0); return 0; };
+    (dom.window as any).acquireVsCodeApi = () => ({ getState: () => undefined, setState() {}, postMessage: (message: any) => messages.push(message) });
+    dom.window.eval(dom.window.document.querySelector('script')!.textContent!);
+    assert.ok(dom.window.document.querySelector('.reader-layout.split > .reader-column > nav'));
+    assert.ok(dom.window.document.querySelector('.reader-column > main'));
+    assert.equal(dom.window.document.querySelectorAll('[role=separator]').length, 2);
+    assert.ok(dom.window.document.querySelector('.work-pane'));
+    assert.match(dom.window.document.querySelector('.work-pane')!.textContent!, /app.ts:9/);
+    assert.equal(dom.window.document.querySelector('.work-pane script'), null);
+    const layout = dom.window.document.querySelector<HTMLElement>('.reader-layout')!;
+    Object.defineProperty(layout, 'clientWidth', { value: 1200 });
+    const directory = dom.window.document.querySelector<HTMLElement>('.post-directory')!;
+    const work = dom.window.document.querySelector<HTMLElement>('.work-pane')!;
+    directory.getBoundingClientRect = () => ({ width: parseFloat(layout.style.getPropertyValue('--directory-width')) || 220 } as DOMRect);
+    work.getBoundingClientRect = () => ({ width: parseFloat(layout.style.getPropertyValue('--work-width')) || 300 } as DOMRect);
+    dom.window.document.querySelector('[data-resize="directory"]')!.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    assert.equal(layout.style.getPropertyValue('--directory-width'), '240px');
+    const resized = messages.find(item => item.action === 'resizeColumns');
+    assert.equal(resized.directoryWidth, 240); assert.equal(resized.workWidth, 300);
+
+    assert.equal(dom.window.document.querySelector('[aria-current="page"]')!.textContent, '1问题');
+    const button = dom.window.document.querySelectorAll<HTMLButtonElement>('.post-directory button[data-action=selectPost]')[1];
+    assert.equal(button.querySelector('script'), null);
+    button.click();
+    assert.equal(messages.filter(item => item.action === 'selectPost').length, 1);
+    assert.equal(messages.find(item => item.action === 'selectPost').url, other.url);
+    const refresh = dom.window.document.querySelector<HTMLButtonElement>('[data-action=refreshDirectory]')!;
+    assert.equal(refresh.parentElement!.lastElementChild, refresh, 'Refresh follows the last post');
+    refresh.click(); refresh.click();
+    assert.equal(messages.filter(item => item.action === 'refreshDirectory').length, 1);
+    assert.equal(refresh.disabled, true);
+    dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: { type: 'directoryRefreshDone' } }));
+    assert.equal(refresh.disabled, false);
+
+  } finally { dom.window.close(); }
+});
 function createReader(article: Article, postMessage: (message: any) => void) {
   const html = renderArticle(article, { images: false, fontSize: 15, saved: false });
   const dom = new JSDOM(html, { runScripts: 'outside-only', url: 'https://reader.test/' });
@@ -104,7 +174,7 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
       registerTreeDataProvider: () => ({ dispose() {} }),
       createWebviewPanel: () => assert.fail('Reading must never open or replace an editor tab'),
       registerWebviewViewProvider: (id: string, value: any, options: any) => {
-        assert.equal(id, 'hnovaFish.reader'); assert.equal(options.webviewOptions.retainContextWhenHidden, true);
+        assert.ok(['hnovaFish.reader', 'hnovaFish.readerBottom'].includes(id)); assert.equal(options.webviewOptions.retainContextWhenHidden, true);
         provider = value; return { dispose() {} };
       },
       withProgress: async (_: unknown, callback: () => Promise<unknown>) => callback(),
@@ -184,6 +254,9 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
     await commands.get('hnovaFish.focusReader')!();
     assert.equal(closed, false); assert.equal(dom, previousDom, 'Hiding the sidebar retains the reader DOM');
     await commands.get('hnovaFish.read')!(parseLink('https://tieba.baidu.com/p/123'));
+    assert.match(dom!.window.document.body.textContent!, /贴吧正文/, 'Show the body before optional previews');
+    const previewDeadline = Date.now() + 3000;
+    while (!dom!.window.document.body.textContent!.includes('贴吧楼中楼 1') && Date.now() < previewDeadline) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(dom!.window.document.querySelector('button[data-action="comments"]')!.textContent, '展开剩余 1 条回复');
     assert.match(dom!.window.document.body.textContent!, /贴吧楼中楼 1/);
     await click('comments');

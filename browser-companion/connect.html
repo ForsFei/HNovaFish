@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>HNova Fish 浏览器连接</title>
+<link rel="stylesheet" href="connect.css">
+<main><h1>连接 VS Code 随手读</h1>
+<p>在 VS Code 运行“HNova Fish 连接贴吧浏览器”，将复制的连接地址粘贴到这里。首次配对后会记住连接；VS Code 重载或短暂断开时自动重连。请保持此连接页和贴吧页面打开。</p>
+<label>连接地址 <input id="address" type="password" autocomplete="off" placeholder="粘贴 VS Code 复制的连接地址"></label>
+<p><button id="connect">连接</button> <button id="disconnect" disabled>断开</button> <button id="tieba">打开贴吧并登录 / 验证</button></p>
+<p id="status" role="status">尚未连接</p>
+<p>帖子通过浏览器当前贴吧页面读取。首次使用或遇到验证时，请点击上方按钮，在贴吧中手动完成登录或验证。连接地址仅供本机配对，请勿分享。“断开”会停止自动重连并忘记本页保存的地址。</p>
+</main><script src="connect.js"></script></html>

@@ -29,19 +29,24 @@ export function applyTiebaPreviews(article: Article, body: string): void {
   }
 }
 
-export async function loadTiebaPreviews(article: Article, cookie?: string, pageUrl?: string, fetcher: typeof fetch = fetch, userAgent?: string): Promise<void> {
-  article.tiebaPreviewVersion = 2;
+export async function loadTiebaPreviews(article: Article, cookie?: string, pageUrl?: string, fetcher: typeof fetch = fetch, userAgent?: string): Promise<boolean> {
+  article.tiebaPreviewVersion = 3;
+  // Modern DOM already includes previews/counts; do not request the legacy API again.
+  const needsPreview = article.sections.some((section, index) => tiebaCommentTarget(article, index)
+    && section.tiebaReplyCount !== 0 && section.tiebaReplyPreview === undefined);
+  if (!needsPreview) return false;
   const target = article.sections.map((_, index) => tiebaCommentTarget(article, index)).find(Boolean);
-  if (!target) return;
+  if (!target) return false;
   const source = new URL(pageUrl || article.url);
   // Mobile continuation offsets cannot be converted reliably to desktop pages.
-  if (source.pathname === '/mo/q/m' && source.searchParams.has('pn')) return;
+  if (source.pathname === '/mo/q/m' && source.searchParams.has('pn')) return false;
   const page = Number(source.searchParams.get('pn') || 1);
-  if (!Number.isSafeInteger(page) || page < 1) return;
+  if (!Number.isSafeInteger(page) || page < 1) return false;
   try {
     const body = await request(`https://tieba.baidu.com/p/totalComment?tid=${target.tid}&pn=${page}&see_lz=0`, 'tieba', cookie, fetcher, userAgent);
     applyTiebaPreviews(article, body);
-  } catch { /* Preserve the readable post and any known counts if previews are blocked. */ }
+    return true;
+  } catch { return false; /* Preserve the readable post and any known counts if previews are blocked. */ }
 }
 
 export function tiebaCommentTarget(article: Article, index: number): TiebaCommentTarget | undefined {

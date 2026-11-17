@@ -4,6 +4,35 @@ import { Providers, parseRecommendations, validateRecommendationUrl, ZHIHU_RECOM
 import { renderArticle } from '../render';
 import { parseLink } from '../model';
 
+test('Zhihu and Tieba batches collect 30 unique recommendations across server pages and retain the next cursor', async () => {
+  for (const source of ['recommend', 'tiebaHome'] as const) {
+    let calls = 0;
+    const provider = new Providers(async () => 'session=test', (async (input: any) => {
+      calls++;
+      const url = new URL(String(input));
+      const page = Number(url.searchParams.get(source === 'recommend' ? 'page_number' : 'pn') || 1);
+      const ids = Array.from({ length: 10 }, (_, i) => (page - 1) * 8 + i + 1);
+      return new Response(JSON.stringify(source === 'recommend'
+        ? { data: ids.map(id => ({ target: { type: 'article', id, title: `推荐${id}` } })), paging: { next: `/api/v3/feed/topstory/recommend?page_number=${page + 1}` } }
+        : { no: 0, data: { html: ids.map(id => `<a href="/p/${id}">推荐${id}</a>`).join(''), has_more: 1 } }));
+    }) as typeof fetch);
+    const result = await provider.recommendationBatch(source);
+    assert.equal(result.entries.length, 30);
+    assert.equal(new Set(result.entries.map(item => item.id)).size, 30);
+    assert.equal(calls, 4);
+    assert.equal(new URL(result.nextUrl!).searchParams.get(source === 'recommend' ? 'page_number' : 'pn'), '5');
+  }
+});
+
+test('a failed later recommendation page preserves the successful items and leaves its cursor for retry', async () => {
+  const provider = new Providers(async () => 'session=test', (async (input: any) => new URL(String(input)).searchParams.get('page_number') === '2'
+    ? new Response('', { status: 403 })
+    : new Response(JSON.stringify({ data: [{ target: { type: 'article', id: 1, title: '可读推荐' } }], paging: { next: '/api/v3/feed/topstory/recommend?page_number=2' } }))) as typeof fetch);
+  const result = await provider.recommendationBatch('recommend');
+  assert.equal(result.entries[0].title, '可读推荐');
+  assert.equal(new URL(result.nextUrl!).searchParams.get('page_number'), '2');
+});
+
 test('parses recommendation answers, articles and questions while keeping platform order', () => {
   const result = parseRecommendations(JSON.stringify({ data: [
     { target: { type: 'answer', id: '99', question: { id: '12', title: '推荐问题' }, author: { name: '作者甲' }, excerpt: '<p>回答摘要</p>' } },

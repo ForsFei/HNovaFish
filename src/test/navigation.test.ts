@@ -98,9 +98,10 @@ test('article navigation follows the clicked list, respects boundaries and boss 
     const pending = run('nextArticle');
     await run('nextArticle'); // Repeated presses do not start a second request.
     await run('bossKey');
-    assert.deepEqual(actions.slice(-3), ['workbench.action.closeAuxiliaryBar', 'workbench.action.closeSidebar', 'workbench.action.focusActiveEditorGroup']);
-    assert.equal(hidden, true);
-    release(); await pending; assert.equal(hidden, true, 'A late article response cannot reopen the reader'); urlShown(2);
+    assert.equal(actions.at(-1), 'workbench.panel.output.focus');
+    assert.equal(hidden, false, 'Boss key preserves sidebar visibility');
+    const afterBoss = actions.length;
+    release(); await pending; assert.equal(actions.length, afterBoss, 'A late article response cannot steal focus from Output'); urlShown(2);
     pause = undefined;
     await run('read', parseLink('https://www.zhihu.com/question/77'));
     const direct = calls;

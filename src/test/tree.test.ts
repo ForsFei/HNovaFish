@@ -36,13 +36,13 @@ test('recommendation refresh replaces the batch, retains it on failure and resta
   };
   Module._load = function(id: string, ...args: unknown[]) { return id === 'vscode' ? mock : originalLoad.call(this, id, ...args); };
   globalThis.fetch = (async (input: unknown, options: RequestInit) => {
-    calls++; assert.equal((options.headers as Record<string, string>).Cookie, session);
+    calls++; assert.equal(new Headers(options.headers).get('Cookie'), session);
     if (fail) return new Response('', { status: 403 });
     const url = new URL(String(input));
     if (url.hostname === 'tieba.baidu.com') {
       if (url.pathname === '/f/index/feedlist') {
         const second = url.searchParams.get('pn') === '2';
-        return new Response(JSON.stringify({ no: 0, data: { html: `<a href="/p/${second ? '102' : '101'}">${second ? '第二批首页推荐' : '第一批首页推荐'}</a>`, has_more: second ? 0 : 1 } }));
+        return new Response(JSON.stringify({ no: 0, data: { html: second ? '<a href="/p/102">第二批首页推荐</a>' : Array.from({ length: 30 }, (_, i) => `<a href="/p/${101 + i * 10}">第一批首页推荐</a>`).join(''), has_more: second ? 0 : 1 } }));
       }
       assert.equal(url.searchParams.get('pn'), '0', 'Forum refresh always requests the first page');
       return new Response(`<a href="/p/${432 + revision}">${revision ? '刷新后的帖子' : '其他贴吧帖子'}</a>`);
@@ -51,7 +51,7 @@ test('recommendation refresh replaces the batch, retains it on failure and resta
     const second = new URL(String(input)).searchParams.get('page_number') === '2';
     return new Response(JSON.stringify({ data: second
       ? [{ target: { type: 'article', id: 3, title: '下一页文章' } }]
-      : [{ target: { type: 'answer', id: 1, question: { id: 2, title: '推荐问题' }, author: { name: '作者' } } }],
+      : Array.from({ length: 30 }, (_, i) => ({ target: { type: 'answer', id: 1 + i, question: { id: 2, title: '推荐问题' }, author: { name: '作者' } } })),
       paging: { is_end: second, next: '/api/v3/feed/topstory/recommend?page_number=2&after_id=1' } }));
   }) as typeof fetch;
   const subscriptions: { dispose(): void }[] = [];
@@ -63,8 +63,8 @@ test('recommendation refresh replaces the batch, retains it on failure and resta
     assert.equal(recommend.title, '知乎 · 个性化推荐'); assert.ok(roots.some((node: any) => node.source === 'zhihu'));
     let children = await tree.getChildren(recommend);
     assert.equal(children[0].entry.title, '推荐问题'); assert.equal(tree.getTreeItem(children[0]).description, '回答 · 作者');
-    assert.equal(children[1].kind, 'more');
-    assert.equal(tree.getTreeItem(children[1]).label, '刷新推荐 · 换一批');
+    assert.equal(children.at(-1).kind, 'more');
+    assert.equal(tree.getTreeItem(children.at(-1)).label, '刷新推荐 · 换一批');
     await tree.getChildren(recommend); assert.equal(calls, 1, 'Expanding a loaded group uses its current list');
     fail = true;
     await commands.get('hnovaFish.more')!(recommend);
@@ -75,7 +75,7 @@ test('recommendation refresh replaces the batch, retains it on failure and resta
     assert.equal(children.length, 2, 'Only the new batch and a refresh button remain');
     assert.equal(children[0].entry.title, '下一页文章');
     assert.ok(!children.some((node: any) => node.entry?.title === '推荐问题'), 'Previous batch is removed');
-    assert.equal(children[1].kind, 'more', 'Refresh remains available after the final page');
+    assert.equal(children.at(-1).kind, 'more', 'Refresh remains available after the final page');
     await commands.get('hnovaFish.more')!(recommend);
     children = await tree.getChildren(recommend);
     assert.equal(children[0].entry.title, '推荐问题');
@@ -83,7 +83,7 @@ test('recommendation refresh replaces the batch, retains it on failure and resta
     session = 'session=two';
     await commands.get('hnovaFish.refresh')!();
     children = await tree.getChildren(recommend);
-    assert.equal(children[1].kind, 'more'); assert.equal(calls, 5, 'Refresh starts a new recommendation request using current cookie');
+    assert.equal(children.at(-1).kind, 'more'); assert.equal(calls, 5, 'Refresh starts a new recommendation request using current cookie');
     let updatedRoots = await tree.getChildren();
     const home = updatedRoots.find((node: any) => node.source === 'tiebaHome');
     assert.equal(home.title, '贴吧 · 首页推荐');
