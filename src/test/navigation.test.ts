@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseLink } from '../model';
+import * as cheerio from 'cheerio';
 
 test('native shortcut defaults are editable commands and arrow bindings only apply to the reader', () => {
   const manifest = JSON.parse(readFileSync(resolve(__dirname, '../../package.json'), 'utf8'));
@@ -27,9 +28,10 @@ test('article navigation follows the clicked list, respects boundaries and boss 
   const actions: string[] = [], errors: string[] = [];
   let tree: any, provider: any, html = '', resolved = false, hidden = false, calls = 0;
   let fail = false, pause: Promise<void> | undefined;
+  let onMessage: (message: { action: string }) => Promise<void>;
   const view = {
     show() { hidden = false; }, onDidDispose() { return { dispose() {} }; },
-    webview: { options: {}, get html() { return html; }, set html(value: string) { html = value; }, onDidReceiveMessage() { return { dispose() {} }; } }
+    webview: { options: {}, get html() { return html; }, set html(value: string) { html = value; }, onDidReceiveMessage(handler: typeof onMessage) { onMessage = handler; return { dispose() {} }; } }
   };
   const mock = {
     EventEmitter: class { event = () => {}; fire() {} dispose() {} },
@@ -65,19 +67,24 @@ test('article navigation follows the clicked list, respects boundaries and boss 
   const subscriptions: { dispose(): void }[] = [];
   const run = (command: string, ...args: any[]) => handlers.get(`hnovaFish.${command}`)!(...args);
   const urlShown = (id: number) => assert.ok(html.includes(`data-page-url="https://www.zhihu.com/question/${id}"`));
+  const disabled = (action: string) => cheerio.load(html)(`nav [data-action="${action}"]`).is(':disabled');
   try {
     require('../extension').activate({ subscriptions, secrets: { get: async () => 'session=test' }, globalState: { get: (key: string, fallback: unknown) => state.get(key) ?? fallback, update: async (key: string, value: unknown) => { state.set(key, value); } } });
     const roots = await tree.getChildren();
     const hot = await tree.getChildren(roots.find((item: any) => item.source === 'zhihu'));
     const recommended = await tree.getChildren(roots.find((item: any) => item.source === 'recommend'));
     await run('read', ...tree.getTreeItem(hot[0]).command.arguments); urlShown(1);
+    assert.equal(disabled('previousArticle'), true);
+    assert.equal(disabled('nextArticle'), false);
     const before = calls;
     await run('previousArticle'); assert.equal(calls, before, 'First item has no previous article');
-    await run('nextArticle'); urlShown(2);
+    await onMessage!({ action: 'nextArticle' }); urlShown(2);
+    assert.equal(disabled('previousArticle'), false);
     await run('nextArticle'); urlShown(3);
+    assert.equal(disabled('nextArticle'), true);
     const last = calls;
     await run('nextArticle'); assert.equal(calls, last, 'Do not wrap or fetch another batch at the boundary');
-    await run('previousArticle'); urlShown(2);
+    await onMessage!({ action: 'previousArticle' }); urlShown(2);
     await run('read', ...tree.getTreeItem(recommended[0]).command.arguments); urlShown(1);
     await run('nextArticle'); urlShown(4);
     const history = await tree.getChildren(roots.find((item: any) => item.source === 'history'));
@@ -104,6 +111,8 @@ test('article navigation follows the clicked list, respects boundaries and boss 
     release(); await pending; assert.equal(actions.length, afterBoss, 'A late article response cannot steal focus from Output'); urlShown(2);
     pause = undefined;
     await run('read', parseLink('https://www.zhihu.com/question/77'));
+    assert.equal(disabled('previousArticle'), true);
+    assert.equal(disabled('nextArticle'), true);
     const direct = calls;
     await run('nextArticle'); assert.equal(calls, direct, 'A standalone URL does not inherit an unrelated list');
     assert.deepEqual(errors, []);

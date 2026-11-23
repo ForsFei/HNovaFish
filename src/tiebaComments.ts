@@ -30,7 +30,7 @@ export function applyTiebaPreviews(article: Article, body: string): void {
 }
 
 export async function loadTiebaPreviews(article: Article, cookie?: string, pageUrl?: string, fetcher: typeof fetch = fetch, userAgent?: string): Promise<boolean> {
-  article.tiebaPreviewVersion = 3;
+  article.tiebaPreviewVersion = 5;
   // Modern DOM already includes previews/counts; do not request the legacy API again.
   const needsPreview = article.sections.some((section, index) => tiebaCommentTarget(article, index)
     && section.tiebaReplyCount !== 0 && section.tiebaReplyPreview === undefined);

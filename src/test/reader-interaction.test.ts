@@ -10,8 +10,8 @@ const answer: Article = { ...parseLink('https://www.zhihu.com/question/12/answer
 test('selecting another post retains the directory scroll but resets body scroll; a new list resets the directory', () => {
   const other = { ...answer, ...parseLink('https://tieba.baidu.com/p/123'), title: '另一个帖子' };
   let state: any;
-  const open = (article: Article, directory: Article[]) => {
-    const dom = new JSDOM(renderArticle(article, { images: false, fontSize: 15, saved: false, bottom: true, directory }), { runScripts: 'outside-only' });
+  const open = (article: Article, directory: Article[], directoryCollapsed = false) => {
+    const dom = new JSDOM(renderArticle(article, { images: false, fontSize: 15, saved: false, bottom: true, directory, directoryCollapsed }), { runScripts: 'outside-only' });
     dom.window.scrollTo = ((options: ScrollToOptions) => { Object.defineProperty(dom.window, 'scrollY', { value: options.top, configurable: true }); }) as typeof dom.window.scrollTo;
     dom.window.requestAnimationFrame = callback => { callback(0); return 0; };
     (dom.window as any).acquireVsCodeApi = () => ({ getState: () => state, setState: (value: any) => { state = value; }, postMessage() {} });
@@ -28,7 +28,15 @@ test('selecting another post retains the directory scroll but resets body scroll
   const second = open(other, [answer, other]);
   assert.equal(second.window.document.querySelector<HTMLElement>('.post-directory')!.scrollTop, 580);
   assert.equal(second.window.scrollY, 0);
+  second.window.document.querySelector<HTMLButtonElement>('#toggle-directory')!.click();
+  assert.equal(state.directoryScroll, 580);
   second.window.close();
+  const reopened = open(other, [answer, other], true);
+  const toggle = reopened.window.document.querySelector<HTMLButtonElement>('#toggle-directory')!;
+  assert.equal(toggle.textContent, '展开目录');
+  toggle.click();
+  assert.equal(reopened.window.document.querySelector<HTMLElement>('.post-directory')!.scrollTop, 580);
+  reopened.window.close();
   const third = open(other, [other]);
   assert.equal(third.window.document.querySelector<HTMLElement>('.post-directory')!.scrollTop, 0);
   third.window.close();
@@ -43,7 +51,11 @@ test('bottom reader has a separate post directory, aligned toolbar and clickable
     dom.window.requestAnimationFrame = callback => { callback(0); return 0; };
     (dom.window as any).acquireVsCodeApi = () => ({ getState: () => undefined, setState() {}, postMessage: (message: any) => messages.push(message) });
     dom.window.eval(dom.window.document.querySelector('script')!.textContent!);
-    assert.ok(dom.window.document.querySelector('.reader-layout.split > .reader-column > nav'));
+    const toolbar = dom.window.document.querySelector<HTMLElement>('.reader-layout.split > .reader-column > nav')!;
+    assert.equal(dom.window.getComputedStyle(toolbar).flexWrap, 'nowrap');
+    assert.equal(dom.window.getComputedStyle(toolbar.firstElementChild!).overflowX, 'auto');
+    assert.ok(toolbar.lastElementChild?.matches('.article-navigation'));
+    assert.equal(toolbar.querySelector('[data-action="hide"]'), null);
     assert.ok(dom.window.document.querySelector('.reader-column > main'));
     assert.equal(dom.window.document.querySelectorAll('[role=separator]').length, 2);
     assert.ok(dom.window.document.querySelector('.work-pane'));
@@ -60,19 +72,45 @@ test('bottom reader has a separate post directory, aligned toolbar and clickable
     const resized = messages.find(item => item.action === 'resizeColumns');
     assert.equal(resized.directoryWidth, 240); assert.equal(resized.workWidth, 300);
 
+    const toggle = dom.window.document.querySelector<HTMLButtonElement>('#toggle-directory')!;
+    toggle.click();
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    assert.equal(dom.window.getComputedStyle(directory).display, 'none');
+    assert.notEqual(dom.window.getComputedStyle(work).display, 'none');
+    assert.equal(messages.filter(item => item.action === 'toggleDirectory').at(-1).collapsed, true);
+    const toolbarRefresh = toolbar.querySelector<HTMLButtonElement>('[data-action=refreshDirectory]')!;
+    const directoryRefresh = directory.querySelector<HTMLButtonElement>('[data-action=refreshDirectory]')!;
+    assert.equal(directory.lastElementChild, directoryRefresh, 'Refresh follows the last post');
+    const finishRefresh = () => dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: { type: 'directoryRefreshDone' } }));
+    toolbarRefresh.click();
+    assert.equal(messages.filter(item => item.action === 'refreshDirectory').length, 1);
+    assert.equal(toolbarRefresh.textContent, '刷新中…');
+    assert.equal(toolbarRefresh.disabled, true);
+    assert.equal(directoryRefresh.disabled, true);
+    assert.equal(toolbar.querySelector<HTMLButtonElement>('[data-action=refresh]')!.disabled, false);
+    finishRefresh();
+    assert.equal(toolbarRefresh.textContent, '刷新列表');
+    assert.equal(directoryRefresh.textContent, '刷新帖子列表');
+    dom.window.document.querySelector('[data-resize="work"]')!.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+    assert.equal(messages.filter(item => item.action === 'resizeColumns').at(-1).workWidth, 320);
+    assert.equal(messages.filter(item => item.action === 'resizeColumns').at(-1).directoryWidth, undefined);
+    toggle.click();
+    assert.equal(toggle.getAttribute('aria-expanded'), 'true');
+    assert.equal(layout.style.getPropertyValue('--directory-width'), '240px');
+
+
     assert.equal(dom.window.document.querySelector('[aria-current="page"]')!.textContent, '1问题');
     const button = dom.window.document.querySelectorAll<HTMLButtonElement>('.post-directory button[data-action=selectPost]')[1];
     assert.equal(button.querySelector('script'), null);
     button.click();
     assert.equal(messages.filter(item => item.action === 'selectPost').length, 1);
     assert.equal(messages.find(item => item.action === 'selectPost').url, other.url);
-    const refresh = dom.window.document.querySelector<HTMLButtonElement>('[data-action=refreshDirectory]')!;
-    assert.equal(refresh.parentElement!.lastElementChild, refresh, 'Refresh follows the last post');
-    refresh.click(); refresh.click();
-    assert.equal(messages.filter(item => item.action === 'refreshDirectory').length, 1);
-    assert.equal(refresh.disabled, true);
-    dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: { type: 'directoryRefreshDone' } }));
-    assert.equal(refresh.disabled, false);
+    directoryRefresh.click();
+    toolbarRefresh.click();
+    assert.equal(messages.filter(item => item.action === 'refreshDirectory').length, 2);
+    finishRefresh();
+    assert.equal(toolbarRefresh.disabled, false);
+    assert.equal(directoryRefresh.disabled, false);
 
   } finally { dom.window.close(); }
 });
@@ -94,8 +132,8 @@ test('every toolbar button actually posts its action when clicked', () => {
   const messages: any[] = [];
   const dom = createReader(answer, message => messages.push(message));
   try {
-    for (const action of ['question', 'fontDown', 'fontUp', 'fontReset', 'save', 'refresh', 'original', 'hide']) dom.window.document.querySelector<HTMLButtonElement>(`button[data-action="${action}"]`)!.click();
-    assert.deepEqual(messages.map(m => m.action), ['question', 'fontDown', 'fontUp', 'fontReset', 'save', 'refresh', 'original', 'hide']);
+    for (const action of ['question', 'fontDown', 'fontUp', 'fontReset', 'save', 'refresh', 'original']) dom.window.document.querySelector<HTMLButtonElement>(`button[data-action="${action}"]`)!.click();
+    assert.deepEqual(messages.map(m => m.action), ['question', 'fontDown', 'fontUp', 'fontReset', 'save', 'refresh', 'original']);
   } finally { dom.window.close(); }
 });
 
@@ -143,7 +181,7 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
   let dom: JSDOM | undefined, onMessage: (m: any) => Promise<void>, onDispose: () => void;
   let calls = 0, closed = false;
   let provider: any, resolved = false;
-  let fontSize = 15;
+  let fontSize = 15, fontBrightness = 100;
   let recoveryReads = 0;
   const panel = {
     title: '', show(_preserveFocus?: boolean) { closed = false; },
@@ -166,9 +204,13 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
     EventEmitter: class { event = () => {}; fire() {} dispose() {} }, ViewColumn: { Active: 1 }, ProgressLocation: { Window: 10 },
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     workspace: { getConfiguration: () => ({
-      get: (key: string, fallback: unknown) => key === 'fontSize' ? fontSize : fallback,
+      get: (key: string, fallback: unknown) => key === 'fontSize' ? fontSize : key === 'fontBrightness' ? fontBrightness : fallback,
       inspect: () => ({}),
-      update: async (key: string, value: number, target: number) => { assert.equal(key, 'fontSize'); assert.equal(target, 1); fontSize = value; }
+      update: async (key: string, value: number, target: number) => {
+        assert.equal(target, 1);
+        if (key === 'fontBrightness') fontBrightness = value;
+        else { assert.equal(key, 'fontSize'); fontSize = value; }
+      }
     }), onDidChangeConfiguration: () => ({ dispose() {} }) },
     window: {
       registerTreeDataProvider: () => ({ dispose() {} }),
@@ -239,18 +281,41 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
     await click('comments'); assert.equal(calls, 3); assert.equal(dom!.window.document.querySelectorAll('.comments>details>.comment').length, 1);
     await click('replies'); assert.equal(calls, 4); assert.equal(dom!.window.document.querySelectorAll('.comment .comment').length, 2);
     await click('repliesMore'); assert.equal(calls, 5); assert.equal(dom!.window.document.querySelectorAll('.comment .comment').length, 3);
+    assert.equal(dom!.window.document.querySelector('[data-action="repliesMore"]'), null);
+    assert.ok(Array.from(dom!.window.document.querySelectorAll('.comment-end')).some(end => end.textContent === '已加载全部回复。'));
+    const readerDom = dom!;
+    const brightness = readerDom.window.document.querySelector<HTMLInputElement>('#font-brightness')!;
+    const readerLayout = readerDom.window.document.querySelector<HTMLElement>('.reader-layout')!;
+    brightness.value = '80';
+    brightness.dispatchEvent(new readerDom.window.Event('input'));
+    assert.equal(readerLayout.style.getPropertyValue('--reader-shade'), 'black');
+    assert.equal(readerLayout.style.getPropertyValue('--reader-shade-mix'), '20%');
+    assert.equal(fontBrightness, 100, 'Dragging only previews the color');
+    brightness.dispatchEvent(new readerDom.window.Event('change'));
+    while (pending.length) await pending.shift();
+    assert.equal(fontBrightness, 80);
+    assert.equal(dom, readerDom, 'Saving brightness preserves the current webview and its focus');
+    assert.equal(calls, 5, 'Brightness does not reload platform data');
     await click('fontUp'); assert.equal(fontSize, 16); assert.equal(dom!.window.document.querySelector('button[data-action="fontReset"]')!.textContent, '16px');
     assert.equal(dom!.window.document.querySelectorAll('.comment .comment').length, 3, 'Changing font preserves loaded replies');
+    assert.equal(dom!.window.document.querySelector<HTMLInputElement>('#font-brightness')!.value, '80', 'Brightness persists across redraws');
+    const reset = dom!.window.document.querySelector<HTMLButtonElement>('#font-brightness-reset')!;
+    reset.click();
+    while (pending.length) await pending.shift();
+    assert.equal(fontBrightness, 100);
+    assert.equal(reset.textContent, '100%');
     for (let i = 0; i < 12; i++) await click('fontUp'); assert.equal(fontSize, 24);
     await click('fontReset'); assert.equal(fontSize, 15);
     for (let i = 0; i < 6; i++) await click('fontDown'); assert.equal(fontSize, 12);
     await click('fontReset'); assert.equal(fontSize, 15); assert.equal(calls, 5, 'Font controls do not reload platform data');
     await click('commentsMore'); assert.equal(calls, 6); assert.equal(dom!.window.document.querySelectorAll('.comments>details>.comment').length, 2);
+    assert.equal(dom!.window.document.querySelector('[data-action="commentsMore"]'), null);
+    assert.ok(Array.from(dom!.window.document.querySelectorAll('.comment-end')).some(end => end.textContent === '已加载全部评论。'));
     assert.equal(dom!.window.document.querySelectorAll('.comment .comment').length, 4, 'Loading more root comments preserves previously loaded replies');
     await click('question'); assert.equal(calls, 7); assert.equal(dom!.window.document.querySelectorAll('.answer-card').length, 2);
     await click('next'); assert.equal(calls, 8); assert.equal(dom!.window.document.querySelectorAll('.answer-card').length, 3);
     const previousDom = dom;
-    await click('hide'); assert.equal(closed, true);
+    await commands.get('hnovaFish.hide')!(); assert.equal(closed, true);
     await commands.get('hnovaFish.focusReader')!();
     assert.equal(closed, false); assert.equal(dom, previousDom, 'Hiding the sidebar retains the reader DOM');
     await commands.get('hnovaFish.read')!(parseLink('https://tieba.baidu.com/p/123'));
@@ -265,6 +330,7 @@ test('right sidebar preserves editor area and supports toolbar, comments, pagina
     assert.equal(dom!.window.document.querySelectorAll('.tieba-replies>.comment').length, 2);
     assert.match(dom!.window.document.body.textContent!, /贴吧楼中楼 2/);
     assert.equal(dom!.window.document.querySelector('button[data-action="commentsMore"]'), null, 'No more button after the final reply');
+    assert.equal(dom!.window.document.querySelector('.tieba-replies .comment-end')?.textContent, '已加载全部回复。');
     await commands.get('hnovaFish.read')!(parseLink('https://tieba.baidu.com/p/456'));
     assert.match(dom!.window.document.body.textContent!, /重新识别并展开 6 条回复/);
     await click('recoverReplies');

@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { Article, Entry, Site, mergeSections, parseLink } from './model';
 import { Providers } from './providers';
-import { renderArticle, renderEmptyReader } from './render';
+import { normalizeFontBrightness, renderArticle, renderEmptyReader } from './render';
 import { CommentView, commentTarget, loadComments, loadReplies } from './comments';
 import { forumName } from './forums';
 import { tiebaCommentTarget, loadTiebaComments, loadTiebaPreviews } from './tiebaComments';
@@ -160,10 +160,17 @@ export function activate(context: vscode.ExtensionContext): void {
     file: uri.path.split('/').pop() || uri.path, line: item.range.start.line + 1,
     severity: ['错误', '警告', '信息', '提示'][item.severity] || '信息', message: item.message
   }))).slice(0, 80);
+  function articleNeighbors(): { previous?: Entry; next?: Entry } {
+    if (!navigation || !current) return {};
+    const { key, items, selectedId } = navigation;
+    const ordered = lists.get(key) || items;
+    const index = ordered.findIndex(item => item.id === selectedId);
+    return index < 0 ? {} : { previous: ordered[index - 1], next: ordered[index + 1] };
+  }
   const draw = () => {
     if (!reader) return;
     reader.title = current?.title || '阅读';
-    reader.webview.html = current ? renderArticle(current, { images: config().get('showImages', false), fontSize: config().get('fontSize', 15), saved: entries('saved').some(e => e.id === current!.id), cached, comments: commentViews, bottom: readerId() === 'hnovaFish.readerBottom', problems: workspaceProblems(), widths: context.globalState.get('readerWidths'), directory: navigation?.items || [current, ...entries('history').filter(e => e.id !== current!.id)] }) : renderEmptyReader();
+    reader.webview.html = current ? renderArticle(current, { images: config().get('showImages', false), fontSize: config().get('fontSize', 15), fontBrightness: config().get('fontBrightness', 100), saved: entries('saved').some(e => e.id === current!.id), cached, comments: commentViews, neighbors: articleNeighbors(), bottom: readerId() === 'hnovaFish.readerBottom', problems: workspaceProblems(), widths: context.globalState.get('readerWidths'), directoryCollapsed: context.globalState.get('readerDirectoryCollapsed', false), directory: navigation?.items || [current, ...entries('history').filter(e => e.id !== current!.id)] }) : renderEmptyReader();
   };
   async function cache(article: Article) {
     // Keep a bounded local cache. Cookies are never stored here.
@@ -198,10 +205,18 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!current) return;
         const { action, url, section, comment } = message as { action?: string; url?: string; section?: number; comment?: string };
         try {
+          if (action === 'toggleDirectory') {
+            const { collapsed } = message as { collapsed?: unknown };
+            if (typeof collapsed === 'boolean') await context.globalState.update('readerDirectoryCollapsed', collapsed);
+            return;
+          }
           if (action === 'resizeColumns') {
             const { directoryWidth, workWidth } = message as { directoryWidth?: number; workWidth?: number };
-            if (typeof directoryWidth === 'number' && Number.isFinite(directoryWidth) && typeof workWidth === 'number' && Number.isFinite(workWidth)) {
-              await context.globalState.update('readerWidths', { directory: Math.max(120, Math.min(480, directoryWidth)), work: Math.max(180, Math.min(600, workWidth)) });
+            if (typeof workWidth === 'number' && Number.isFinite(workWidth)) {
+              const previous = context.globalState.get<{ directory?: number }>('readerWidths');
+              const directory = typeof directoryWidth === 'number' && Number.isFinite(directoryWidth)
+                ? Math.max(120, Math.min(480, directoryWidth)) : previous?.directory ?? 220;
+              await context.globalState.update('readerWidths', { directory, work: Math.max(180, Math.min(600, workWidth)) });
             }
             return;
           }
@@ -218,26 +233,39 @@ export function activate(context: vscode.ExtensionContext): void {
             } finally { void reader?.webview.postMessage({ type: 'directoryRefreshDone' }); }
             return;
           }
+          if (action === 'previousArticle' || action === 'nextArticle') {
+            await navigate(action === 'previousArticle' ? -1 : 1);
+            return;
+          }
           if (action === 'selectPost' && typeof url === 'string') {
             const allowed = navigation?.items || [current, ...entries('history')];
             const entry = allowed.find(item => item.url === url);
             if (entry && entry.id !== current.id) await read(entry, false, undefined, navigation?.key);
             return;
           }
-          if (action === 'fontDown' || action === 'fontUp' || action === 'fontReset') {
+          if (action === 'fontBrightness' || action === 'fontDown' || action === 'fontUp' || action === 'fontReset') {
+            const { brightness } = message as { brightness?: unknown };
+            if (action === 'fontBrightness' && (typeof brightness !== 'number' || !Number.isFinite(brightness))) return;
             fontChange = fontChange.catch(() => {}).then(async () => {
               const settings = config();
-              const value = action === 'fontReset' ? 15 : Math.max(12, Math.min(24, settings.get<number>('fontSize', 15) + (action === 'fontUp' ? 1 : -1)));
-              const scope = settings.inspect<number>('fontSize');
-              const target = scope?.workspaceFolderValue !== undefined ? vscode.ConfigurationTarget.WorkspaceFolder : scope?.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
-              await settings.update('fontSize', value, target); draw();
+              const key = action === 'fontBrightness' ? 'fontBrightness' : 'fontSize';
+              const value = key === 'fontBrightness' ? normalizeFontBrightness(brightness)
+                : action === 'fontReset' ? 15 : Math.max(12, Math.min(24, settings.get<number>('fontSize', 15) + (action === 'fontUp' ? 1 : -1)));
+              const scope = settings.inspect<number>(key);
+              const target = scope?.workspaceFolderValue !== undefined ? vscode.ConfigurationTarget.WorkspaceFolder
+                : scope?.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+              try {
+                if (settings.get<number>(key) !== value) await settings.update(key, value, target);
+              } finally {
+                if (key === 'fontSize') draw();
+                else void view.webview.postMessage({ type: 'fontBrightness', value: normalizeFontBrightness(settings.get(key)) });
+              }
             });
             await fontChange; return;
           }
           if ((action === 'replies' || action === 'repliesMore') && typeof section === 'number' && typeof comment === 'string') { await readReplies(section, comment, action === 'repliesMore'); return; }
           if ((action === 'comments' || action === 'commentsMore') && typeof section === 'number') { await readComments(section, action === 'commentsMore'); return; }
           if (action === 'recoverReplies' && typeof section === 'number') { await recoverReplies(section); return; }
-          if (action === 'hide') { await closeReader(); return; }
           if (action === 'original') { await external(current.url); return; }
           if (action === 'link' && typeof url === 'string') { await external(url); return; }
           if (action === 'save') {
@@ -341,19 +369,19 @@ export function activate(context: vscode.ExtensionContext): void {
     };
     const stored = context.globalState.get<Article[]>('articles', []).find(a => a.id === entry.id);
     const legacyQuestionCache = entry.site === 'zhihu' && /^\/question\/\d+\/?$/.test(new URL(entry.url).pathname) && !stored?.kind;
-    const legacyTiebaCache = entry.site === 'tieba' && stored && stored.tiebaPreviewVersion !== 3;
+    const legacyTiebaCache = entry.site === 'tieba' && stored && stored.tiebaPreviewVersion !== 5;
     if (stored && !fresh && !legacyQuestionCache && !legacyTiebaCache) { selectNavigation(); await show(stored, true); await record(stored); return; }
     if (nextUrl) loadingNext = true;
     try {
       const article = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: '随手读：正在加载正文…' }, async () => {
         const result = await providers.article(entry, nextUrl);
-        if (result.site === 'tieba') result.tiebaPreviewVersion = 3;
+        if (result.site === 'tieba') result.tiebaPreviewVersion = 5;
         return result;
       });
       if (disposed || ticket !== generation) return;
       if (!nextUrl) commentViews = {};
       if (nextUrl && previous?.id === article.id) {
-        article.sections = article.site === 'zhihu' ? mergeSections(previous.sections, article.sections) : [...previous.sections, ...article.sections];
+        article.sections = mergeSections(previous.sections, article.sections);
         article.totalAnswers ??= previous.totalAnswers;
       }
       selectNavigation(); await show(article, false); await cache(article); await record(article);
@@ -367,6 +395,7 @@ export function activate(context: vscode.ExtensionContext): void {
     } catch (error) {
       if (disposed || ticket !== generation) return;
       if (stored && !nextUrl) { selectNavigation(); await show(stored, true); await record(stored); }
+      if (nextUrl) { void vscode.window.showWarningMessage(errorMessage(error)); return; }
       const choice = await vscode.window.showWarningMessage(errorMessage(error), '查看原文', '设置 Cookie');
       if (choice === '查看原文') await external(entry.url);
       if (choice === '设置 Cookie') await vscode.commands.executeCommand('hnovaFish.cookie', entry.site);
@@ -397,11 +426,10 @@ export function activate(context: vscode.ExtensionContext): void {
     resetLists();
     void vscode.window.showInformationMessage('已断开浏览器协同，贴吧恢复直接请求模式。');
   });
-  async function navigate(direction: number) {
-    if (navigating || !navigation || !current) return;
-    const items = lists.get(navigation.key) || navigation.items;
-    const index = items.findIndex(item => item.id === navigation!.selectedId);
-    const entry = index < 0 ? undefined : items[index + direction];
+  async function navigate(direction: -1 | 1) {
+    if (navigating || !navigation) return;
+    const neighbors = articleNeighbors();
+    const entry = direction === -1 ? neighbors.previous : neighbors.next;
     if (!entry) return;
     navigating = true;
     const ticket = ++navigationRun;
@@ -518,7 +546,11 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.commands.executeCommand('setContext', 'hnovaFish.readerFocused', false);
       if (current) void vscode.commands.executeCommand(`${readerId()}.focus`);
     }
-    if (e.affectsConfiguration('hnovaFish')) draw();
+    if (e.affectsConfiguration('hnovaFish.fontBrightness')) {
+      const value = normalizeFontBrightness(config().get('fontBrightness', 100));
+      for (const view of readerViews.values()) void view.webview.postMessage({ type: 'fontBrightness', value });
+    }
+    if (['fontSize', 'showImages', 'readerPosition'].some(key => e.affectsConfiguration(`hnovaFish.${key}`))) draw();
   }));
 }
 

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createContext, runInContext } from 'node:vm';
+import { parseTiebaArticle, validateTiebaPage } from '../providers';
+import { mergeSections, parseLink } from '../model';
 
 test('companion remembers pairing, automatically retries host reloads and forgets it on explicit disconnect', async () => {
   const address = `http://127.0.0.1:12345/#${'a'.repeat(64)}`;
@@ -76,7 +78,7 @@ test('companion reads rendered content even while subresources keep loading and 
 });
 
 
-test('injected reader waits for rendered DOM mutations and rejects an empty shell', async () => {
+test('injected reader follows virtual floors after the cursor leaves the DOM and rejects an empty shell', async () => {
   const { JSDOM } = require('jsdom');
   let injected: Function | undefined;
   const elements = new Map<string, any>();
@@ -90,6 +92,37 @@ test('injected reader waits for rendered DOM mutations and rejects an empty shel
   });
   runInContext(readFileSync(resolve(__dirname, '../../browser-companion/connect.js'), 'utf8'), context);
   await runInContext('readPage("https://tieba.baidu.com/p/123")', context);
+  const virtual = new JSDOM('<html><head><title>测试帖子</title></head><body><div class="pc-pb-box"><div class="pb-content-wrap">主楼</div><div class="pb-comment-item" data-id="1"><div class="comment-content">第一层<div class="pc-pb-comments-desc">第2楼</div></div></div></div></body></html>', { url: 'https://tieba.baidu.com/p/123', runScripts: 'outside-only' });
+  try {
+    virtual.window.TextEncoder = TextEncoder;
+    const reader = virtual.window.eval(`(${injected!.toString()})`);
+    const entry = parseLink('https://tieba.baidu.com/p/123');
+    const first = parseTiebaArticle((await reader(entry.url)).body, entry);
+    assert.equal(first.nextUrl, `${entry.url}?hnova_after=1&hnova_floor=2`);
+    const box = virtual.window.document.querySelector('.pc-pb-box')!;
+    (box as any).scrollBy = () => {
+      box.querySelector('.pb-comment-item')?.remove();
+      box.insertAdjacentHTML('beforeend', '<div class="pb-comment-item" data-id="2"><div class="comment-content">滚动后的第二层<div class="pc-pb-comments-desc">第3楼</div></div></div>');
+    };
+    const second = parseTiebaArticle((await reader(first.nextUrl)).body, entry, first.nextUrl);
+    assert.equal(second.nextUrl, `${entry.url}?hnova_after=2&hnova_floor=3`);
+    assert.equal(mergeSections(first.sections, second.sections).length, 3);
+    assert.match(second.sections.at(-1)!.html, /滚动后的第二层/);
+    // Retry with the old cursor after the previous anchor was recycled.
+    const retried = parseTiebaArticle((await reader(first.nextUrl)).body, entry, first.nextUrl);
+    assert.equal(retried.nextUrl, second.nextUrl);
+    assert.equal(mergeSections(first.sections, retried.sections).length, 3);
+    (box as any).scrollBy = () => {
+      box.insertAdjacentHTML('beforeend', '<span>没有更多回复</span>');
+    };
+    const last = parseTiebaArticle((await reader(second.nextUrl)).body, entry, second.nextUrl);
+    assert.equal(last.nextUrl, undefined);
+    assert.equal(mergeSections(mergeSections(first.sections, second.sections), last.sections).length, 3);
+    assert.equal(validateTiebaPage(`${entry.url}?hnova_after=2&hnova_floor=-1`, entry), undefined);
+
+    assert.equal(validateTiebaPage('https://tieba.baidu.com/p/999?hnova_after=2', entry), undefined);
+    assert.equal(validateTiebaPage(`${entry.url}?hnova_after=bad`, entry), undefined);
+  } finally { virtual.window.close(); }
   for (const content of [true, false]) {
     const dom = new JSDOM('<html><head><title>贴吧</title></head><body></body></html>', { url: 'https://tieba.baidu.com/p/123', runScripts: 'outside-only' });
     try {

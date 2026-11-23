@@ -81,7 +81,11 @@ export class BrowserBridge {
     return new Promise<Response>((resolve, reject) => {
       const id = randomBytes(16).toString('hex');
       const finish = () => { clearTimeout(timer); this.pending.delete(id); init?.signal?.removeEventListener('abort', abort); };
-      const abort = () => { finish(); reject(new Error('浏览器读取已取消。')); };
+      const abort = () => {
+        finish();
+        const timedOut = init?.signal?.reason?.name === 'TimeoutError';
+        reject(new Error(timedOut ? '等待 Edge 返回楼层超时，请切到贴吧标签页后重试。' : '浏览器读取已取消。'));
+      };
       const timer = setTimeout(() => { finish(); reject(new Error('浏览器读取超时，请在 Edge 中检查贴吧登录或验证页面。')); }, 45000);
       this.pending.set(id, { id, url, sent: false, resolve: value => { finish(); resolve(value); }, reject: error => { finish(); reject(error); } });
       init?.signal?.addEventListener('abort', abort, { once: true });
@@ -165,7 +169,14 @@ export class BrowserBridge {
       const result = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       const item = this.pending.get(result.id);
       if (!item) { response.writeHead(410).end(); return; }
-      if (typeof result.error === 'string') item.reject(new Error('浏览器读取失败，请在配套扩展连接页查看原因并在贴吧完成登录或验证。'));
+      if (typeof result.error === 'string') {
+        const messages = new Map([
+          ['floor_position', '浏览器中的帖子位置已变化，请重新加载正文后继续。'],
+          ['floor_verification', '请在 Edge 的贴吧标签页完成安全验证，再重试加载楼层。'],
+          ['floor_timeout', '暂未取得更多楼层，请切到 Edge 的贴吧标签页后重试。'],
+        ]);
+        item.reject(new Error(messages.get(result.code) || '浏览器读取失败，请在配套扩展连接页查看原因。'));
+      }
       else if (typeof result.body === 'string' && Buffer.byteLength(result.body) <= 8 * 1024 * 1024 && Number.isInteger(result.status) && result.status >= 200 && result.status <= 599) {
         item.resolve(new Response([204, 205, 304].includes(result.status) ? null : result.body, { status: result.status }));
       } else { response.writeHead(400).end(); return; }

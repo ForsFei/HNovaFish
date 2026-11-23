@@ -1,7 +1,7 @@
 declare const acquireVsCodeApi: () => {
   getState(): { url?: string; scroll?: number; directoryKey?: string; directoryScroll?: number } | undefined;
   setState(state: { url: string; scroll: number; directoryKey?: string; directoryScroll?: number }): void;
-  postMessage(message: { action: string; url?: string; section?: number; comment?: string; focused?: boolean; directoryWidth?: number; workWidth?: number }): void;
+  postMessage(message: { action: string; url?: string; section?: number; comment?: string; focused?: boolean; directoryWidth?: number; workWidth?: number; brightness?: number; collapsed?: boolean }): void;
 };
 
 // This function is serialized into the Webview. Keep all dependencies local or
@@ -25,50 +25,102 @@ function initializeReader(): void {
   const previous = vscode.getState();
   const savedScroll = typeof previous?.scroll === 'number' && Number.isFinite(previous.scroll) ? Math.max(0, previous.scroll) : 0;
   const initialScroll = previous?.url === pageUrl ? savedScroll : 0;
+  const layout = document.querySelector<HTMLElement>('.reader-layout');
   const directory = document.querySelector<HTMLElement>('.post-directory');
+  let directoryCollapsed = layout?.classList.contains('directory-collapsed') ?? false;
   const directoryKey = directory ? Array.from(directory.querySelectorAll<HTMLElement>('[data-url]'), item => item.dataset.url).join('\n') : '';
   const initialDirectoryScroll = previous?.directoryKey === directoryKey && typeof previous?.directoryScroll === 'number' && Number.isFinite(previous.directoryScroll) ? Math.max(0, previous.directoryScroll) : 0;
-  const state = (scroll: number) => ({ url: pageUrl, scroll, directoryKey, directoryScroll: directory?.scrollTop ?? initialDirectoryScroll });
-  if (directory) directory.scrollTop = initialDirectoryScroll;
+  let directoryScroll = initialDirectoryScroll;
+  const restoreDirectory = () => { if (directory && !directoryCollapsed) directory.scrollTop = directoryScroll; };
+  const state = (scroll: number) => ({ url: pageUrl, scroll, directoryKey, directoryScroll });
+  restoreDirectory();
 
   // A reused Webview may retain its old scroll position even when the URL
   // changes. Explicitly reset both the Webview state and the document position.
   vscode.setState(state(initialScroll));
   let interacted = false;
   for (const event of ['wheel', 'pointerdown', 'keydown']) window.addEventListener(event, () => { interacted = true; }, { once: true, passive: true });
-  const restore = () => { if (!interacted) { window.scrollTo({ left: 0, top: initialScroll, behavior: 'instant' }); if (directory) directory.scrollTop = initialDirectoryScroll; } };
+  const restore = () => { if (!interacted) { window.scrollTo({ left: 0, top: initialScroll, behavior: 'instant' }); restoreDirectory(); } };
   restore();
   requestAnimationFrame(() => requestAnimationFrame(restore));
   window.addEventListener('load', () => requestAnimationFrame(restore), { once: true });
-  const remember = () => vscode.setState(state(window.scrollY));
+  const remember = () => {
+    if (directory && !directoryCollapsed) directoryScroll = directory.scrollTop;
+    vscode.setState(state(window.scrollY));
+  };
   directory?.addEventListener('scroll', remember, { passive: true });
+  const toggleDirectory = document.querySelector<HTMLButtonElement>('#toggle-directory');
+  if (toggleDirectory && directory && layout) {
+    toggleDirectory.addEventListener('click', () => {
+      interacted = true;
+      if (!directoryCollapsed) directoryScroll = directory.scrollTop;
+      directoryCollapsed = !directoryCollapsed;
+      layout.classList.toggle('directory-collapsed', directoryCollapsed);
+      toggleDirectory.setAttribute('aria-expanded', String(!directoryCollapsed));
+      toggleDirectory.textContent = directoryCollapsed ? '展开目录' : '收起目录';
+      restoreDirectory();
+      remember();
+      vscode.postMessage({ action: 'toggleDirectory', collapsed: directoryCollapsed });
+    });
+  }
   let timer: ReturnType<typeof setTimeout>;
   window.addEventListener('scroll', () => {
     clearTimeout(timer);
     timer = setTimeout(remember, 150);
   });
-  window.addEventListener('message', event => {
-    if (event.data?.type === 'directoryRefreshDone') {
-      const button = document.querySelector<HTMLButtonElement>('[data-action=refreshDirectory]');
-      if (button) { button.disabled = false; button.textContent = '刷新帖子列表'; }
+  const brightness = document.querySelector<HTMLInputElement>('#font-brightness');
+  const resetBrightness = document.querySelector<HTMLButtonElement>('#font-brightness-reset');
+  const previewBrightness = (value: number) => {
+    if (!brightness || !resetBrightness || !layout) return;
+    brightness.value = String(value);
+    const level = brightness.valueAsNumber;
+    const label = `${level}%`;
+    brightness.setAttribute('aria-valuetext', label);
+    resetBrightness.textContent = label;
+    layout.style.setProperty('--reader-shade', level < 100 ? 'black' : 'white');
+    layout.style.setProperty('--reader-shade-mix', `${Math.abs(level - 100)}%`);
+  };
+  brightness?.addEventListener('input', () => previewBrightness(brightness.valueAsNumber));
+  brightness?.addEventListener('change', () => vscode.postMessage({ action: 'fontBrightness', brightness: brightness.valueAsNumber }));
+  resetBrightness?.addEventListener('click', () => {
+    previewBrightness(100);
+    vscode.postMessage({ action: 'fontBrightness', brightness: 100 });
+  });
+  const directoryRefreshButtons = Array.from(
+    document.querySelectorAll<HTMLButtonElement>('button[data-action="refreshDirectory"]'),
+    button => ({ button, label: button.textContent })
+  );
+  const setDirectoryRefreshing = (refreshing: boolean) => {
+    for (const { button, label } of directoryRefreshButtons) {
+      button.disabled = refreshing;
+      button.textContent = refreshing ? '刷新中…' : label;
     }
+  };
+  window.addEventListener('message', event => {
+    if (event.data?.type === 'fontBrightness' && typeof event.data.value === 'number' && Number.isFinite(event.data.value)) {
+      previewBrightness(event.data.value);
+    }
+    if (event.data?.type === 'directoryRefreshDone') setDirectoryRefreshing(false);
     if (event.data?.type === 'loadingDone') {
       const button = document.querySelector<HTMLButtonElement>('button[data-action="next"]');
       if (button) { button.disabled = false; button.textContent = nextLabel; }
     }
   });
-  const layout = document.querySelector<HTMLElement>('.reader-layout.split');
-  if (layout) {
+  const work = layout?.querySelector<HTMLElement>('.work-pane');
+  if (layout && directory && work) {
     const resize = (name: string, change: number) => {
-      const directory = layout.querySelector<HTMLElement>('.post-directory')!;
-      const work = layout.querySelector<HTMLElement>('.work-pane')!;
-      const left = directory.getBoundingClientRect().width, right = work.getBoundingClientRect().width;
+      const left = directoryCollapsed ? 0 : directory.getBoundingClientRect().width;
+      const right = work.getBoundingClientRect().width;
       const width = name === 'directory'
         ? Math.max(120, Math.min(480, layout.clientWidth - right - 232, left + change))
-        : Math.max(180, Math.min(600, layout.clientWidth - left - 232, right + change));
+        : Math.max(180, Math.min(600, layout.clientWidth - left - (directoryCollapsed ? 226 : 232), right + change));
       layout.style.setProperty(name === 'directory' ? '--directory-width' : '--work-width', `${width}px`);
     };
-    const saveWidths = () => vscode.postMessage({ action: 'resizeColumns', directoryWidth: layout.querySelector('.post-directory')!.getBoundingClientRect().width, workWidth: layout.querySelector('.work-pane')!.getBoundingClientRect().width });
+    const saveWidths = () => vscode.postMessage({
+      action: 'resizeColumns',
+      ...(directoryCollapsed ? {} : { directoryWidth: directory.getBoundingClientRect().width }),
+      workWidth: work.getBoundingClientRect().width
+    });
     for (const divider of layout.querySelectorAll<HTMLElement>('[data-resize]')) {
       divider.addEventListener('pointerdown', event => {
         event.preventDefault(); divider.setPointerCapture(event.pointerId);
@@ -91,7 +143,7 @@ function initializeReader(): void {
     if (button) {
       remember();
       if (button.disabled) return;
-      if (button.dataset.action === 'refreshDirectory') { button.disabled = true; button.textContent = '刷新中…'; }
+      if (button.dataset.action === 'refreshDirectory') setDirectoryRefreshing(true);
       if (button.dataset.action === 'next') { button.disabled = true; button.textContent = '正在加载…'; }
       vscode.postMessage({ action: button.dataset.action!, ...(button.dataset.url ? { url: button.dataset.url } : {}), ...(button.dataset.section === undefined ? {} : { section: Number(button.dataset.section) }), ...(button.dataset.comment === undefined ? {} : { comment: button.dataset.comment }) });
       return;

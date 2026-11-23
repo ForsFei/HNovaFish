@@ -15,7 +15,7 @@ export interface Article extends Entry {
 export function mergeSections(previous: Section[], incoming: Section[]): Section[] {
   const result = [...previous];
   for (const section of incoming) {
-    if (!result.some(old => (old.id && section.id && old.id === section.id) || (old.author === section.author && old.html === section.html))) result.push(section);
+    if (!result.some(old => old.id && section.id ? old.id === section.id : old.author === section.author && old.html === section.html)) result.push(section);
   }
   return result;
 }

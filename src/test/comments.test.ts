@@ -71,3 +71,20 @@ test('reply display offers expansion, pagination and retry controls with root id
   const expanded = renderArticle(article, { images: false, fontSize: 18, saved: false, comments: { '0': { items: [root], replies: { '101': { items: [], nextUrl: replyUrl('101'), error: '访问受限' } } } } });
   assert.match(expanded, /加载更多回复/); assert.match(expanded, /重试加载回复/); assert.match(expanded, /访问受限/);
 });
+
+test('known totals hide extra comment and reply controls while unknown preview counts remain expandable', () => {
+  const child = { id: '2', author: '乙', html: '回复', children: [] };
+  const root = { id: '1', author: '甲', html: '评论', children: [child], moreReplies: 0 };
+  const options = { images: false, fontSize: 15, saved: false };
+  const html = renderArticle(article, { ...options, comments: { '0': {
+    items: [root], total: 1, nextUrl: commentUrl(target)
+  } } });
+  assert.match(html, /已加载全部评论/);
+  assert.match(html, /已加载全部回复/);
+  assert.doesNotMatch(html, /data-action="(?:commentsMore|replies)"/);
+  const unknown = parseComments('{"data":[{"id":"1","content":"评论","child_comments":[{"id":"2","content":"回复"}]}]}', target, commentUrl(target));
+  const partial = renderArticle(article, { ...options, comments: { '0': { ...unknown, total: 2 } } });
+  assert.match(partial, /data-action="replies"/);
+  assert.match(partial, /已加载全部可见评论/);
+  assert.doesNotMatch(partial, /已加载全部回复/);
+});

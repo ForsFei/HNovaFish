@@ -88,5 +88,5 @@ test('does not silently substitute a hot list for failed recommendations', async
 });
 test('recommended answer provides a route to other answers under the question', () => {
   const html = renderArticle({ ...parseLink('https://www.zhihu.com/question/12/answer/99'), sections: [{ author: '作者', html: '正文' }], fetchedAt: 1 }, { images: false, fontSize: 15, saved: false });
-  assert.match(html, /data-action="question">查看问题的其他回答/);
+  assert.match(html, /data-action="question" title="查看问题的其他回答">其他回答/);
 });

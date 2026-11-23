@@ -91,7 +91,7 @@ export function parseRecommendations(body: string, currentUrl = ZHIHU_RECOMMEND_
 export async function request(url: string, site: Site, cookie?: string, fetcher: typeof fetch = fetch, userAgent?: string): Promise<string> {
   assertSiteUrl(url, site);
   const response = await fetcher(url, {
-    redirect: 'manual', signal: AbortSignal.timeout(site === 'tieba' ? 45000 : 18000),
+    redirect: 'manual', signal: AbortSignal.timeout(new URL(url).searchParams.has('hnova_after') ? 15000 : site === 'tieba' ? 45000 : 18000),
     headers: { 'User-Agent': userAgent?.trim() || USER_AGENT, 'Accept': 'application/json,text/html;q=0.9',
       ...(site === 'tieba' ? { 'Referer': 'https://tieba.baidu.com/', 'Accept-Language': 'zh-CN,zh;q=0.9' } : {}), ...(cookie ? { Cookie: cookie } : {}) }
   });
@@ -157,6 +157,13 @@ export function validateTiebaPage(input: string, entry: Entry): string | undefin
     const id = new URL(canonical.url).pathname.split('/').pop()!;
     const url = new URL(input, canonical.url);
     if (!['https:', 'http:'].includes(url.protocol) || url.hostname !== 'tieba.baidu.com' || url.username || url.password || url.port) return;
+    const after = url.searchParams.get('hnova_after');
+    const floor = url.searchParams.get('hnova_floor');
+    if (after !== null) {
+      if (url.pathname !== `/p/${id}` || !/^\d{1,32}$/.test(after) || url.protocol !== 'https:' || url.searchParams.has('pn')) return;
+      if (floor !== null && !/^[1-9]\d{0,8}$/.test(floor)) return;
+      return `https://tieba.baidu.com/p/${id}?hnova_after=${after}${floor ? `&hnova_floor=${floor}` : ''}`;
+    }
     const pn = url.searchParams.get('pn');
     if (pn !== null && !/^\d{1,9}$/.test(pn)) return;
     if (url.pathname === `/p/${id}`) return `https://tieba.baidu.com/p/${id}${pn === null ? '' : `?pn=${pn}`}`;
@@ -239,6 +246,11 @@ export function parseTiebaArticle(html: string, entry: Entry, pageUrl = entry.ur
       const normalized = validateTiebaPage(new URL(next, pageUrl).href, entry);
       if (normalized && Number(new URL(normalized).searchParams.get('pn')) > Number(new URL(pageUrl).searchParams.get('pn') || 0)) nextUrl = normalized;
     } catch { /* A broken next link must not discard readable floors. */ }
+  }
+  const browserNext = $('meta[name="hnova-tieba-next"]').attr('content');
+  if (browserNext && $('.pb-comment-item[data-id]').length) {
+    const normalized = validateTiebaPage(browserNext, entry);
+    if (normalized && normalized !== pageUrl && new URL(normalized).searchParams.has('hnova_after')) nextUrl = normalized;
   }
   return { ...entry, title: $('.pb-title, h3.core_title_txt, h1, .thread_title, .ti_title').first().text().trim() || $('title').text().replace(/_.*$/, '').trim() || entry.title, sections, nextUrl, fetchedAt: Date.now() };
 }

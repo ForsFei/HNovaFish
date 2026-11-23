@@ -2,7 +2,7 @@
   "name": "hnova-fish",
   "displayName": "HNova Fish · 随手读",
   "description": "在 VS Code 中只读浏览贴吧、知乎，支持收藏、历史与专注阅读。",
-  "version": "0.1.35",
+  "version": "0.1.43",
   "publisher": "hnova",
   "engines": {
     "vscode": "^1.143.0"
@@ -201,11 +201,6 @@
           "group": "navigation"
         },
         {
-          "command": "hnovaFish.hide",
-          "when": "(view == hnovaFish.reader || view == hnovaFish.readerBottom)",
-          "group": "navigation"
-        },
-        {
           "command": "hnovaFish.browseForum",
           "when": "view == hnovaFish.feed",
           "group": "navigation"
@@ -270,6 +265,13 @@
           "minimum": 12,
           "maximum": 24,
           "description": "正文字号。"
+        },
+        "hnovaFish.fontBrightness": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 70,
+          "maximum": 130,
+          "description": "正文和评论的字体亮度。100% 使用当前主题原色，低于 100% 调暗，高于 100% 调亮。"
         },
         "hnovaFish.tiebaUserAgent": {
           "type": "string",

@@ -43,6 +43,7 @@ async function readPage(url) {
           && ['kw', 'pn', 'kz'].every(key => current.searchParams.get(key) === expected.searchParams.get(key));
       } catch { return false; }
     };
+    const navigationUrl = new URL(url); navigationUrl.searchParams.delete('hnova_after');
     // Wait for navigation to commit, not for ads and other subresources to finish.
     await new Promise((resolve, reject) => {
       const finish = error => {
@@ -56,7 +57,7 @@ async function readPage(url) {
       const timer = setTimeout(() => finish(new Error('贴吧目标地址尚未打开，请检查专用贴吧标签页是否出现登录或验证')), 12000);
       chrome.tabs.onUpdated.addListener(updated);
       (async () => {
-        if (!matchesTarget(tab.url)) await chrome.tabs.update(tab.id, { url });
+        if (!matchesTarget(tab.url)) await chrome.tabs.update(tab.id, { url: navigationUrl.href });
         const current = await chrome.tabs.get(tab.id);
         if (matchesTarget(current.url)) finish();
       })().catch(finish);
@@ -89,7 +90,78 @@ async function readPage(url) {
           if (outcome === 'verification') return { error: '请在贴吧标签页手动完成安全验证，然后在 VS Code 重试' };
           if (outcome !== 'ready') return { error: '贴吧已打开，但尚未出现可读取的帖子内容；请切到专用贴吧标签页确认页面正常，再重试' };
         }
-        const body = document.documentElement.outerHTML;
+        const after = expected.searchParams.get('hnova_after');
+        const scroller = /^\/p\/\d+\/?$/.test(expected.pathname) ? document.querySelector('.pc-pb-box') : null;
+        const floorNumber = node => Number(node.querySelector('.pc-pb-comments-desc')?.textContent.match(/第\s*(\d+)\s*楼/)?.[1] || 0);
+        const floors = () => [...(scroller?.querySelectorAll('.pb-comment-item[data-id]') || [])].filter(node => {
+          const body = node.querySelector('.comment-content');
+          return body && (body.textContent.trim() || body.querySelector('img'));
+        });
+        const atEnd = () => scroller && [...scroller.querySelectorAll('div, span, p')].some(node =>
+          node.childElementCount === 0 && !node.closest('.pb-comment-item, .pb-content-wrap')
+          && /^(?:没有更多(?:了|回复)?|暂无更多(?:回复)?|已加载全部(?:回复)?)$/.test(node.textContent.trim())
+        );
+        let exhausted = false;
+        let lastFloor = floors().at(-1);
+        if (after) {
+          if (!/^\d{1,32}$/.test(after) || !scroller) return { error: '此页面不支持继续读取楼层，请重新加载正文', code: 'floor_position' };
+          const floorHint = Number(expected.searchParams.get('hnova_floor') || 0);
+          const initial = floors();
+          let foundAnchor = initial.some(node => node.getAttribute('data-id') === after);
+          const known = new Set(initial.map(node => node.getAttribute('data-id')));
+          // A cached cursor may outlive this browser document. Seek forward from the top
+          // in viewport-sized steps so the virtual list cannot skip unread floors.
+          if (!foundAnchor && (!floorHint || !initial.some(node => floorNumber(node) > 0 && floorNumber(node) <= floorHint))) {
+            scroller.scrollTop = 0;
+          }
+          const deadline = Date.now() + 8000;
+          const outcome = await new Promise(resolve => {
+            let timer;
+            const observer = new MutationObserver(check);
+            function finish(result) { observer.disconnect(); clearTimeout(timer); resolve(result); }
+            function check() {
+              if (document.title.includes('安全验证')) { finish('verification'); return true; }
+              if (Date.now() >= deadline) { finish('timeout'); return true; }
+              const visible = floors();
+              const anchorIndex = visible.findIndex(node => node.getAttribute('data-id') === after);
+              if (anchorIndex >= 0) foundAnchor = true;
+              const candidates = anchorIndex >= 0 ? visible.slice(anchorIndex + 1) : visible;
+              const next = candidates.filter(node => (floorHint && floorNumber(node))
+                ? floorNumber(node) > floorHint
+                : foundAnchor && (anchorIndex >= 0 || !known.has(node.getAttribute('data-id'))));
+              if (next.length && (foundAnchor || next.some(node => floorNumber(node) === floorHint + 1))) {
+                lastFloor = next.at(-1); finish('ready'); return true;
+              }
+              if (foundAnchor && atEnd()) { finish('end'); return true; }
+              return false;
+            }
+            function advance() {
+              if (check()) return;
+              const delta = Math.max(64, scroller.clientHeight * 0.7);
+              scroller.scrollBy({ top: delta, behavior: 'instant' });
+              timer = setTimeout(advance, 300);
+            }
+            observer.observe(scroller, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['data-id'] });
+            advance();
+          });
+          if (outcome === 'verification') return { error: '请在贴吧标签页手动完成安全验证后重试', code: 'floor_verification' };
+          if (outcome === 'timeout') return { error: '暂未取得更多楼层，请切到 Edge 的专用贴吧标签页后重试', code: 'floor_timeout' };
+          exhausted = outcome === 'end';
+        }
+        const snapshot = document.documentElement.cloneNode(true);
+        if (lastFloor && !exhausted && !atEnd()) {
+          const last = lastFloor.getAttribute('data-id');
+          if (/^\d{1,32}$/.test(last)) {
+            const next = new URL(expected.href);
+            next.searchParams.set('hnova_after', last);
+            next.searchParams.delete('hnova_floor');
+            const number = floorNumber(lastFloor);
+            if (number > 0) next.searchParams.set('hnova_floor', String(number));
+            const marker = document.createElement('meta'); marker.name = 'hnova-tieba-next'; marker.content = next.href;
+            snapshot.querySelector('head').append(marker);
+          }
+        }
+        const body = snapshot.outerHTML;
         if (new TextEncoder().encode(body).length > 8 * 1024 * 1024) return { error: '贴吧页面超过 8 MB' };
         return { status: 200, body };
       }
@@ -158,7 +230,17 @@ document.querySelector('#connect').onclick = async () => {
         if (session !== current || !running) break;
         status.textContent = '正在读取贴吧…';
         let result;
-        try { result = await readPage(task.url); } catch (error) { result = { error: error.message }; }
+        try {
+          const loading = readPage(task.url);
+          if (new URL(task.url).searchParams.has('hnova_after')) {
+            let timer;
+            try {
+              result = await Promise.race([loading, new Promise(resolve => {
+                timer = setTimeout(() => resolve({ error: '浏览器未及时返回楼层，请切到贴吧标签页后重试', code: 'floor_timeout' }), 12000);
+              })]);
+            } finally { clearTimeout(timer); }
+          } else result = await loading;
+        } catch (error) { result = { error: error.message }; }
         if (session !== current || !running) break;
         const posted = await fetch(`${base}/result`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ id: task.id, ...result }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]) });
         if (session !== current || !running) break;

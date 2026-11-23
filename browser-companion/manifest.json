@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "HNova Fish 浏览器协同",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "description": "使用当前浏览器的贴吧页面读取帖子，连接本机 VS Code 随手读。",
   "permissions": [
     "scripting"

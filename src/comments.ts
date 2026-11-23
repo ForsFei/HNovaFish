@@ -4,7 +4,7 @@ import { PlatformError, request } from './providers';
 
 const json = JSONbig({ storeAsString: true });
 export interface CommentTarget { type: 'answers' | 'articles'; id: string; }
-export interface CommentItem { id: string; author: string; html: string; votes?: number; replyTo?: string; children: CommentItem[]; moreReplies: number; }
+export interface CommentItem { id: string; author: string; html: string; votes?: number; replyTo?: string; children: CommentItem[]; moreReplies?: number; }
 export interface CommentPage { items: CommentItem[]; nextUrl?: string; total?: number; }
 export interface CommentView extends CommentPage { loading?: boolean; error?: string; replies?: Record<string, CommentView>; }
 
@@ -40,11 +40,11 @@ function parseCommentData(body: string, pageUrl: string, validate: (input: strin
   const parseItem = (item: any, nested = false): CommentItem | undefined => {
     if (!item || !/^\d+$/.test(String(item.id)) || typeof item.content !== 'string') return;
     const children: CommentItem[] = nested ? [] : (Array.isArray(item.child_comments) ? item.child_comments : []).flatMap((child: any) => { const value = parseItem(child, true); return value ? [value] : []; });
-    const count = Number(item.child_comment_count ?? 0);
+    const count = Number(item.child_comment_count ?? NaN);
     return { id: String(item.id), author: item.author?.member?.name || item.author?.name || '知乎用户', html: item.content,
       votes: typeof item.like_count === 'number' ? item.like_count : undefined,
       replyTo: item.reply_to_author?.member?.name || item.reply_to_author?.name,
-      children, moreReplies: Number.isSafeInteger(count) ? Math.max(0, count - children.length) : 0 };
+      children, moreReplies: Number.isSafeInteger(count) && count >= 0 ? Math.max(0, count - children.length) : undefined };
   };
   const items: CommentItem[] = result.data.flatMap((item: any) => { const value = parseItem(item); return value ? [value] : []; });
   const next = result.paging?.is_end !== true && typeof result.paging?.next === 'string' ? validate(result.paging.next) : undefined;

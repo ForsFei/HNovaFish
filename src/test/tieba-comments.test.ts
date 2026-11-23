@@ -68,6 +68,7 @@ test('Tieba previews show at most three replies, hide empty floors and count the
   article.sections[0].tiebaReplyCount = 3;
   html = renderArticle(article, { images: false, fontSize: 15, saved: false });
   assert.ok(!html.includes('data-action="comments"'));
+  assert.match(html, /已加载全部回复/);
   applyTiebaPreviews(article, JSON.stringify({ data: { comment_list: { [target.pid]: { comment_num: 0, comment_info: [] } } } }));
   html = renderArticle(article, { images: false, fontSize: 15, saved: false });
   assert.ok(!html.includes('tieba-replies')); assert.ok(!html.includes('暂无可见楼中楼'));
